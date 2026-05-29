@@ -1,0 +1,3949 @@
+---
+title: "Recoverability of market-wide fair insurance premiums under selection bias : R Code"
+author: "Marie-Pier Côté, Olivier Côté, and Arthur Charpentier"
+output: 
+  html_document: 
+    code_folding: show
+    toc: yes
+    toc_float: yes
+    css: ../misc/style.css
+    highlight: pygments
+    theme: cosmo
+editor_options: 
+  chunk_output_type: console
+---
+
+# Libraries, user-defined functions and Python setup
+
+```{r packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(latex2exp)
+library(jsonlite)
+library(reticulate)
+library(lightgbm)
+```
+
+A few functions are required:
+
+```{r source}
+source('___functions.R')
+```
+
+
+Let's setup Python.
+
+```{r setup, include=FALSE}
+tryCatch({
+  python_env_path <- get_python_env_path()
+  use_python(python_env_path, required = TRUE)
+  message("Python environment successfully set to: ", python_env_path)
+}, error = function(e) {
+  stop(e$message)
+})
+```
+
+Choose the colors for the plots.
+
+```{r setcolors}
+colors_for_gg_D <- c("deeppink2", "#3B93C7") 
+colors_for_gg_A <- c("#00C5CD", "#800080") 
+
+colors_for_gg_market <- c("market" = "#B8C0CA",
+                          "A=1" = colors_for_gg_A[2],
+                          "A=0" = colors_for_gg_A[1]) 
+colors_for_gg_premium <- c("best"="#000000",
+                           "un"='#9966CC',
+                           "aw"= '#F7798D',
+                           'corr' = '#ffd332')
+
+# blue '#96eaff' '#4ea0cf'
+# vert '#a1ff91' '#60ff82'
+# orange '#e5d14a'
+```
+
+
+# Simulation and exploratory plots
+
+Now that we have functions, setup and simulate. 
+
+The parameters for the base scenario.
+
+```{r orig_param}
+parms_original <- list('p' = 0.5, # P(D = 1), this the anchor point (root node)
+                       
+              'b_0' = 100, # beta0 for P(Y|X, D)
+              'b_d' = 15, # betaD for P(Y|X, D)
+              'b_x' = 3, # betaX for P(Y|X, D)
+              'b_A' = 0, # betaA for P(Y|X, D) (moral hazard)
+              'sd_Y' = sqrt(45), # sd for  P(Y|X, D) (gaussian)
+                       
+              'g_0' = 1, # gamma mean for P(X)
+              'rho_xd' = 0.9, # rho for copula C(X, D)
+              'sd_X' = 3, # sd for P(X|D) (gaussian)
+                       
+              'pA' = 0.5, # desired marginal dist for P(A = 1) (alpha0 deduced from there)
+              'a_d' = -3, # alphaD for P(A|X, D)
+              'a_x' = -0.5 # alphaX for P(A|X, D)
+              )
+
+n <- 1e5
+```
+
+The parameters for the six scenarios.
+
+```{r scenario_param}
+parms <- list('original' = parms_original,
+              'neutral' = {tmp <- parms_original; tmp[['rho_xd']] <- 0; tmp},
+              'noDtoA' = {tmp <- parms_original; tmp[['a_d']] <- 0; tmp},
+              'noDtoY' = {tmp <- parms_original; tmp[['b_d']] <- 0; tmp},
+              'nodiscr' = {tmp <- parms_original; tmp[['rho_xd']] <- 0; tmp[['b_d']] <- 0; tmp},
+              'noselbias' = {tmp <- parms_original; tmp[['a_d']] <- 0; tmp[['a_x']] <- 0; tmp})
+
+
+## (later used for ggplot2 titles)
+long_labels_for_parms <- c("(a) Base scenario",
+                      "(b) No link D to X",
+                      "(c) No link D to A",
+                      "(d) No link D to Y",
+                      "(e) No discrimination",
+                      "(f) No selection bias")
+names(long_labels_for_parms) <- names(parms)
+```
+
+The simulations are saved into a separate folder. If the simulations already exist in the folder, we read them, otherwise we generate the data and save. For each scenario, we generate a training set, a validation set and a testing set.
+
+```{r generate, include=FALSE}
+set.seed(131929) 
+
+## the simulation files
+files_sims <- paste0('simuls/',
+                     c('train', 'valid', 'test'),
+                     '_scenarios.json')
+
+## If the folder do not exist... 
+if (!dir.exists('simuls')) {
+  dir.create('simuls')
+}
+
+## We read the simulations, or we do them and save them (json for general data format and easy communication with Python)
+if(file.exists(files_sims[1])){# load
+  sims <- jsonlite::fromJSON(files_sims[1])
+} else {# simulate and write
+  set.seed(321) # original set.seed - no sel bias is weird for A=0
+#  set.seed(2024225) # optional set.seed - other things are weird, so stick with the first choice.
+  sims <- parms %>% lapply(function(parameters){
+  simulate_ex_art(n = n, params = parameters)
+  })
+  sims %>% jsonlite::toJSON(., pretty = TRUE) %>% write(files_sims[1])
+}
+
+if(file.exists(files_sims[2])){ # load
+  valid <- jsonlite::fromJSON(files_sims[2])
+} else { # simulate and write
+  set.seed(123)
+  valid <- parms %>% lapply(function(parameters){
+  simulate_ex_art(n = n/10, params = parameters)
+})
+  valid %>% jsonlite::toJSON(., pretty = TRUE) %>% write(files_sims[2])
+}
+
+if(file.exists(files_sims[3])){ # load
+  test <- jsonlite::fromJSON(files_sims[3])
+} else { # simulate and write
+  set.seed(132)
+  test <- parms %>% lapply(function(parameters){
+  simulate_ex_art(n = n/10, params = parameters)
+  })
+  test %>% jsonlite::toJSON(., pretty = TRUE) %>% write(files_sims[3])
+}
+
+```
+
+We first plot the response in terms of $D$ and the portfolio inclusion $A$ for each scenario.As expected, portfolio $A=1$ consists of lower risk individuals (except in scenario f) and individuals with $D=1$ are riskier.
+
+```{r exploration1, fig.height=10, echo=FALSE}
+
+# lapply(names(sims), function(pop_name) {
+#   ggplot(sims[[pop_name]], aes(x=factor(D), y=Y, colour = factor(A)))+
+#     geom_boxplot()+
+#     scale_color_manual(values = colors_for_gg_A, name = "A")+
+#     theme_minimal()+
+#     labs(x="D",
+#          title=long_labels_for_parms[pop_name])}) %>%
+#   ggpubr::ggarrange(plotlist = .,
+#                            nrow = 3, ncol=2,
+#                            widths = 15, heights = 1,
+#                            common.legend = T,
+#                            legend = 'right')
+  
+
+(tosave_scenarios <- lapply(names(valid)[1:3], function(pop_name) {
+  valid[[pop_name]] %>%
+    sample_n(2.5e3) %>% 
+    mutate(D = factor(D), A=factor(A))%>%
+    ggplot( aes(x=X, y=Y, colour = D, shape=D))+
+    geom_point(alpha=0.35)+
+    facet_wrap(~A, 
+               labeller = labeller(A=c("0" = "A=0", "1" = "A=1")))+
+    scale_color_manual(values = colors_for_gg_D, name = "D")+
+    theme_minimal()+
+    ggtitle(long_labels_for_parms[pop_name])
+    }) %>%
+  ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 12, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_scenarios.pdf",
+       plot = tosave_scenarios,
+       height = 3,
+       width = 9,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+# Plots of the theoretical expressions
+
+We focus on the first three scenarios.
+
+
+## Expectation of D given X and A
+
+The expectation of $D$ given $X$ can be computed analytically.
+
+```{r expDgivenX}
+ExpDgivenX <- function(pop_name, x){
+  g <- parms[[pop_name]]$g_0 
+  rho_xd <- parms[[pop_name]]$rho_xd 
+  sd <- parms[[pop_name]]$sd_X 
+  1- pnorm((0-rho_xd*(x-g)/sd)/sqrt(1-rho_xd^2))
+}
+
+ExpDgivenXA <- function(pop_name, x, a){
+ 
+  param <- parms[[pop_name]]
+  
+  rho_xd <- param$rho_xd 
+  a_0 <- -1 * sum(param[['a_x']]*param[['g_0']] + param[['a_d']] * param[['p']])
+ 
+  probAgivenXD1 <- (exp(a_0+param[['a_x']]*x+param[['a_d']]))^(a==1)/(1+exp(a_0+param[['a_x']]*x+param[['a_d']]))
+  
+  probAgivenXD0 <- (exp(a_0+param[['a_x']]*x))^(a==1)/(1+exp(a_0+param[['a_x']]*x))
+    
+  expDgivenX <- 1- pnorm((0-rho_xd*(x-param$g_0 )/param$sd_X)/sqrt(1-rho_xd^2))
+  
+  expDgivenXAnum <- probAgivenXD1*expDgivenX
+  
+  expDgivenXAnum/(expDgivenXAnum +probAgivenXD0*(1- expDgivenX))
+}
+
+par(mfrow=c(2,3))
+for (j in names(parms)){
+curve(ExpDgivenX(j, x), -10,10, ylab="E(D|X=x)", main=long_labels_for_parms[[j]], ylim=c(0,1))
+curve(ExpDgivenXA(j, x, 1), add=TRUE,col=colors_for_gg_A[2], lty=2)
+curve(ExpDgivenXA(j, x, 0), add=TRUE,col=colors_for_gg_A[1], lty=3)
+}
+
+```
+
+Plot the Prob that D=1 given X and given X and A for the first three scenarios.
+
+```{r plotExpDgivenXA, fig.width=12,fig.height=6, echo=FALSE}
+short_grid <- expand.grid(x = parms_original$g_0 + 
+                            parms_original$sd_X * 
+                            qnorm(seq(0.001, 0.999, by = 0.01)),
+                             d = 0:1)
+
+(to_save_theo_expDgivenX <- names(parms)[1:3] %>% 
+  lapply(function(pop_name){
+    
+    toplotDat <- short_grid %>% 
+      mutate(market = sapply(1:nrow(short_grid), function(i){ 
+        ExpDgivenX(pop_name,short_grid[i, 'x'])}),
+        "A=1" = sapply(1:nrow(short_grid), function(i){
+        ExpDgivenXA(pop_name,short_grid[i, 'x'], 1)}),
+        "A=0" = sapply(1:nrow(short_grid), function(i){
+        ExpDgivenXA(pop_name,short_grid[i, 'x'], 0)})
+        ) %>% 
+      reshape2::melt(measure.vars = c('market', 'A=0','A=1'))
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("$E(D|X=x, A)$")
+      the_y_scale <- scale_y_continuous(breaks = seq(0, 1, by=0.5), limits=c(0,1))
+      the_x_label <- latex2exp::TeX("$x$")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(breaks = seq(0, 1, by=0.5), limits=c(0,1))
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+      
+      
+    toplotDat %>% ggplot(aes(x = x, y = value,
+               col = variable, linetype = variable,
+               linewidth=variable
+               )) + 
+      geom_line(alpha = 0.75) + 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)  + # see above
+      the_y_scale +
+  theme_classic()+
+#  theme_minimal()+
+  theme(plot.title = element_text(hjust=0.5))+
+  scale_color_manual(values = colors_for_gg_market, name = "A") +
+  scale_linetype_manual(values = c(1, 2,3), name = "A") +
+  scale_linewidth_manual(values = c(1.5,1, 1.2), name = 'A') 
+  }) %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+
+
+ggsave(filename = "figs/graph_theo_expDgivenXA.pdf",
+       plot = to_save_theo_expDgivenX,
+       height = 2.00,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+
+Expectation of D given A for Table in article.
+
+```{r}
+# Two functions we need to integrate numerically to get the aware premium by subportfolio
+
+funtointegrate1 <- function(x,a,param){
+  
+  rho_xd <- param$rho_xd 
+ a_0 <- -1 * sum(param[['a_x']]*param[['g_0']] + param[['a_d']] * param[['p']])
+ 
+  probAgivenXD1 <- (exp(a_0+param[['a_x']]*x+param[['a_d']]))^(a==1)/(1+exp(a_0+param[['a_x']]*x+param[['a_d']]))
+  
+  expDgivenX <- 1- pnorm((0-rho_xd*(x-param$g_0 )/param$sd_X)/sqrt(1-rho_xd^2))
+  
+  probAgivenXD1*expDgivenX*dnorm(x,param$g_0,param$sd_X)
+}
+
+funtointegrate2 <- function(x,a,param){
+  rho_xd <- param$rho_xd 
+ a_0 <- -1 * sum(param[['a_x']]*param[['g_0']] + param[['a_d']] * param[['p']])
+ 
+  probAgivenXD0 <- (exp(a_0+param[['a_x']]*x))^(a==1)/(1+exp(a_0+param[['a_x']]*x))
+  
+  expDgivenX <- pnorm((0-rho_xd*(x-param$g_0 )/param$sd_X)/sqrt(1-rho_xd^2))
+  
+  probAgivenXD0*expDgivenX*dnorm(x,param$g_0,param$sd_X)
+}
+
+
+expDgivenA <- function(param, a=1){
+    num <- integrate(funtointegrate1, lower=-100, upper=100, a=a,param=param)$value
+    denom2 <- integrate(funtointegrate2, lower=-100, upper=100, a=a,param=param)$value
+  num/(num+denom2)
+}
+
+(toprintExpDgivenA <- parms %>% lapply(FUN=expDgivenA))
+
+round(unlist(toprintExpDgivenA),3)
+```
+
+Plot for graphical abstract, scenario (a) only.
+
+```{r plotExpDgivenXAscA, fig.width=6,fig.height=6, echo=FALSE}
+
+pop_name <- names(parms)[1]
+
+    toplotDat <- short_grid %>% 
+      mutate(market = sapply(1:nrow(short_grid), function(i){ 
+        ExpDgivenX(pop_name,short_grid[i, 'x'])}),
+        "A=1" = sapply(1:nrow(short_grid), function(i){
+        ExpDgivenXA(pop_name,short_grid[i, 'x'], 1)}),
+        "A=0" = sapply(1:nrow(short_grid), function(i){
+        ExpDgivenXA(pop_name,short_grid[i, 'x'], 0)})
+        ) %>% 
+      reshape2::melt(measure.vars = c('market', 'A=0','A=1'))
+    
+      
+(to_save_theo_expDgivenX_ScA <-  ggplot(toplotDat, 
+                                       aes(x = x, y = value,
+               col = variable, linetype = variable,
+               linewidth=variable
+               )) + 
+      geom_line(alpha = 0.75) + 
+  labs(x = latex2exp::TeX("$x$"),
+       y = latex2exp::TeX("$E(D|X=x, A)$")) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)  + # see above
+      scale_y_continuous(breaks = seq(0, 1, by=0.5), limits=c(0,1)) +
+  theme_classic()+
+#  theme_minimal()+
+  theme(panel.background=element_rect(fill="transparent"),
+        plot.background = element_rect(fill='transparent', color=NA),
+        legend.background = element_rect(fill='transparent'),
+        legend.position=c(0.25,0.8))+
+  scale_color_manual(values = colors_for_gg_market, name = "") +
+  scale_linetype_manual(values = c(1, 2,3), name = "") +
+  scale_linewidth_manual(values = c(1.5,1, 1.2), name = ''))
+  
+
+ggsave(filename = "figs/graph_theo_expDgivenXA_ScA.pdf",
+       plot = to_save_theo_expDgivenX_ScA,
+       height = 1.75,
+       width = 2.25,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+## Premiums
+
+Functions to compute the theoretical premiums.
+
+```{r premFUN}
+# Best-estimate. a is taken in argument but is not used.
+BEfun <- function(pop_name, x, d, a){ 
+  param <- parms[[pop_name]]
+  param$b_0+param$b_d*d+param$b_x*x
+}
+
+
+# Unaware given A. d is taken in argument but is not used.
+# a takes values 0, 1 or 2 for market
+UNfun <- function(pop_name,x,d,a){
+ 
+  param <- parms[[pop_name]]
+  
+  if(a==2){
+    out <- param$b_0+param$b_d*ExpDgivenX(pop_name,x)+param$b_x*x
+  }else{
+  out <- param$b_0+param$b_d*ExpDgivenXA(pop_name,x,a)+param$b_x*x
+  }
+  out
+}
+
+
+
+# Aware premium given A. A=2 is the market.
+AWfun <- function(pop_name,x,d,a){
+  
+  param <- parms[[pop_name]]
+  
+  if(a==2){
+      out <- param$b_0+param$b_d*param$p+param$b_x*x
+  }else{
+  
+    num <- integrate(funtointegrate1, lower=-100, upper=100, a=a,param=param)$value
+    denom2 <- integrate(funtointegrate2, lower=-100, upper=100, a=a,param=param)$value
+  expDgivenA <- num/(num+denom2)
+
+  out <- param$b_0+param$b_d*expDgivenA+param$b_x*x
+  }
+  out
+}
+Vectorize(AWfun, c("x","a"))
+
+grid_to_test2 <- expand.grid(x = unique(short_grid$x),
+                             d = 0:1, 
+                             a = 0:2)
+```
+
+## Corrective 
+
+### Functions
+
+```{r}
+# Load necessary library
+library(stats)
+
+expit <- function(eta) {
+        eta <- pmin(pmax(eta, -20), 20)  # Clip to avoid extreme values
+        return(ifelse(eta > 0, 
+                      1 / (1 + exp(-eta)), 
+                      exp(eta) / (1 + exp(eta))))
+      }
+
+
+# Function to compute mu(X, D)
+mu_X_D <- function(X, d, params) {
+        params$b_0+params$b_d*d+params$b_x*X
+      }
+
+# Vectorized and compact function to compute the conditional density of X given D
+conditional_density_X_given_D <- function(X, D, params) {
+        
+        # Extract parameters
+        mu_X <- params[['g_0']]        # Mean of X (marginally Gaussian)
+        sigma_X <- params[['sd_X']]  # Standard deviation of X
+        rho <- params[['rho_xd']]          # Copula correlation parameter
+        p_D1 <- params[['p']]        # Marginal probability of D = 1
+        p_D0 <- 1 - p_D1                # Marginal probability of D = 0
+        
+        # Compute marginal density of X (Gaussian)
+        marginal_X <- dnorm(X, mean = mu_X, sd = sigma_X)
+        
+        # Compute the conditional probability of D = 1 given X
+        z <- (-rho * (X - mu_X)) / (sigma_X * sqrt(1 - rho^2))  # The Z-transform for the copula
+        prob_D1_given_X <- 1 - pnorm(z)                            # Probability for D = 1
+        prob_D0_given_X <- pnorm(z)                                # Probability for D = 0
+        
+        # Compute the conditional density for D = 1 and D = 0, vectorized with ifelse
+        conditional_density <- ifelse(D == 1,
+                                      (marginal_X * prob_D1_given_X) / p_D1,
+                                      (marginal_X * prob_D0_given_X) / p_D0)
+        
+        return(conditional_density)
+      }
+
+# # Log-Sum-Exp Trick function
+# log_sum_exp <- function(eta1, eta2) {
+#         max_eta <- pmax(eta1, eta2)
+#         
+#         # Check if the difference is large enough to avoid computation
+#         diff <- abs(eta1 - eta2)
+#         
+#         # Only compute the log1p part when the difference is not too large
+#         result <- ifelse(diff > 30, max_eta, max_eta + log1p(exp(-diff)))
+#         
+#         return(result)
+#       }
+
+# Corrected smooth indicator function
+smooth_indicator <- function(x, lower_bound, upper_bound, epsilon = 1e-3) {
+        # Smooth transition between 0 and 1 for the lower bound
+        lower_transition <- 1 / (1 + exp(-1 * (x - lower_bound) / epsilon))
+        
+        # Smooth transition between 1 and 0 for the upper bound
+        upper_transition <- 1 / (1 + exp( (x - upper_bound) / epsilon))
+        
+        # The indicator is 1 inside the bounds and smoothly decays to 0 outside
+        return(lower_transition * upper_transition)
+      }
+
+get_bounds_x <- function(s, d, params){
+        
+          lower_bound <- params[['g_0']] - 7 * params[['sd_X']]  # Typically capture ~99.999% of the distribution
+          upper_bound <- params[['g_0']] + 7 * params[['sd_X']]  # Typically capture ~99.999% of the distribution
+          
+          if(s == Inf){
+            return(c(lower_bound, upper_bound))
+          } else if(params[['b_x']] > 0){
+            upper_bound <- min(upper_bound, 
+                                 (s - (params[['b_0']] + params[['b_d']] *
+                                         d))/(params[['b_x']]) - 1e-3)
+          } else if(params[['b_x']] > 0){
+            lower_bound <- max(lower_bound, 
+                               (s - (params[['b_0']] + params[['b_d']] *
+                                       d))/(params[['b_x']]) + 1e-3)
+          }
+          
+        return(c(lower_bound, upper_bound))
+      }
+
+pAa_XD_fun <- function(a, x, d, params){
+  # Calculate components for eta_A using log-sum-exp trick
+  a_0 <- -1 * (params[['a_x']] * params[['g_0']] + params[['a_d']] * params[['p']])
+        
+  # Instead of summing directly, apply the log-sum-exp trick
+  eta_A <- a_0 + params[['a_x']] * x + params[['a_d']] * d
+        
+  return(ifelse(a == 1, expit(eta_A), 1 - expit(eta_A)))
+}
+
+
+sapply(seq(-10, 10), function(x){
+  pAa_XD_fun(a = 0, x= x, d = 0, params = parms$original)
+}) %>%  plot(seq(-10, 10),.)
+
+# Function to compute eta_A using the log-sum-exp trick
+int_func_gen <- function(x, d, a, s, params) {
+        ## for the market : A == 2
+        pAa_XD <- ifelse(a == 2, 
+                     0.5, 
+                     pAa_XD_fun(a = a, x = x, d = d, params = params))
+        
+        bounds <- get_bounds_x(s = s, d = d, params = params)
+        
+        smooth_indicator(x, bounds[1], bounds[2]) *
+          pAa_XD *
+          conditional_density_X_given_D(X = x, D = d, params)
+      }
+
+# Function to check the behavior of int_func_gen over a range of s values
+check_int_func_gen_behavior <- function(s_vals, x_vals, d, a, params) {
+                # Store results in a matrix to analyze
+              results <- matrix(0, nrow = length(x_vals), ncol = length(s_vals))
+              
+              # Fill the matrix with int_func_gen evaluations
+              for (i in seq_along(x_vals)) {
+                for (j in seq_along(s_vals)) {
+                  results[i, j] <- int_func_gen(x = x_vals[i], d = d, a = a, s = s_vals[j], params = params)
+                }
+              }
+          
+          # Visualize the results using image and contour plots
+          image(x_vals, s_vals, results, main = "int_func_gen values", xlab = "x", ylab = "s")  # 's' on x-axis, 'x' on y-axis
+          contour(x_vals, s_vals, results, add = TRUE, col = "blue")  # Matching axes for contour plot
+            # Check the behavior at a specific x value, say x = 1
+            x_fixed <- 1
+            int_func_values <- sapply(s_vals, function(s) int_func_gen(x = x_fixed, d = d, a = a, s = s, params = params))
+            plot(s_vals, int_func_values, type = 'b', col = "blue", main = paste("int_func_gen at x =", x_fixed),
+                 xlab = "s", ylab = "int_func_gen value")
+            
+            # Check the behavior at a specific x value, say x = 1
+            s_fixed <- 110
+            int_func_values <- sapply(x_vals, function(x) int_func_gen(x = x, d = d, a = a, s = s_fixed, params = params))
+            plot(x_vals, int_func_values, type = 'b', col = "blue", main = paste("int_func_gen at s =", s_fixed),
+                 xlab = "x", ylab = "int_func_gen value")
+          }
+
+par(mfrow = c(2, 3))
+# Test for a range of s values and x values
+x_values <- seq(-7, 13, length.out = 100)
+s_values <- seq(45, 150, length.out = 100)
+
+check_int_func_gen_behavior(s_vals = s_values,
+                            x_vals = x_values, d = 1, a = 1, params = parms$neutral)
+
+check_int_func_gen_behavior(s_vals = s_values,
+                            x_vals = x_values, d = 1, a = 1, params = parms$original)
+
+par(mfrow = c(1, 1))
+library(Rcpp)
+
+# Usage
+to_int_rcpp <- function(s, d, a, params) {
+        
+        cppFunction("
+          double integrate_cpp(NumericVector x_vals, NumericVector y_vals) {
+            int n = x_vals.size();
+            double sum = 0.0;
+            for (int i = 1; i < n; ++i) {
+              sum += (x_vals[i] - x_vals[i-1]) * (y_vals[i] + y_vals[i-1]) / 2.0;
+            }
+            return sum;
+          }
+        ")
+        
+        bounds_num <- get_bounds_x(s = s, d = d,
+                                   params = params)
+        
+        x_vals <- seq(bounds_num[1], bounds_num[2],
+                      length.out = 1000)
+        
+        y_vals <- sapply(x_vals,
+                         function(x) int_func_gen(x, d = d,
+                                                  a = a, s = s,
+                                                  params = params))
+          
+          max(integrate_cpp(x_vals, y_vals), 1e-10)
+        }
+
+precompute_denominator <- function(d, a, params) {
+          to_int_rcpp(s = 200, d = d,
+                      a = a, params = params)
+        }
+
+
+estimate_cdf <- function(s, d, a, params, denominator) {
+            # Compute dynamic integration bounds based on X's properties
+            bounds <- get_bounds_x(s = s, d = d, params = params)
+            
+            # Recompute denominator dynamically if needed
+            if (missing(denominator) || is.null(denominator)) {
+              denominator <- precompute_denominator(d = d,
+                                                    a = a,
+                                                    params = params)
+            }
+            
+            # Integration with tighter tolerance and better bounds
+            numerator <- to_int_rcpp(s = s, d = d,
+                                     a = a, params = params)
+            
+            return(exp(log(numerator) - 
+                         log(denominator)))
+          }
+
+# Optimized function to invert the CDF (Quantile function F^-1_S|D,A)
+quantile_function <- function(prob, d, a, params, denominator, tol = 1e-6, max_iter = 150) {
+  
+  # CDF function that will be inverted
+  cdf_function <- function(s) {
+    return(estimate_cdf(s = s, d = d, a = a, params = params, denominator = denominator))
+  }
+  
+  clipped_prob <- max(min(prob, 1 - 1e-5), 1e-5)
+  
+  # Root-finding for the quantile (inverse of CDF)
+  cdf_diff <- function(s) {
+    return(cdf_function(s) - prob)
+  }
+  
+  # Use uniroot to find the quantile (inverse of CDF) within the bounds [50, 150]
+  quantile_result <- uniroot(cdf_diff, lower = 25, upper = 200, tol = tol, maxiter = max_iter)
+  
+  return(quantile_result$root)
+}
+
+
+corr <- function(x, d, a, params, p1a){
+  ## the best estimate score
+  the_score <- mu_X_D(x, d, params)
+  
+  ## one u only 
+  u <- estimate_cdf(s = the_score, d = d,
+                          a = a,
+                          params = params)
+  
+  ## push the u on every possible d
+  the_transported <- sapply(0:1, function(d_alt){
+    denom <- precompute_denominator(d = d_alt, a = a, params = params)
+    quantile_function(prob = u, d = d_alt, a = a, params = params,
+                      denominator = denom)
+  })
+  
+  ## agregate
+  return(
+  (1 - p1a) * the_transported[1] +
+    p1a * the_transported[2]
+  )
+}
+
+```
+
+### The corrective function
+
+```{r}
+make_corr_theo_grid <- function(scenario_name){
+message1 <- paste0('--- SCENARIO : ', scenario_name, ' ---')
+print(message1)
+parameters <- parms[[scenario_name]]
+my_corr_grid <- grid_to_test2
+
+lil_table <- my_corr_grid %>% 
+  dplyr::select(d, a) %>% 
+  distinct() %>% 
+  mutate(denom = sapply(1:length(d), function(i){
+    precompute_denominator(d = d[i],
+                           a = a[i],
+                           params = parameters)
+    })
+    )
+
+## add denom
+my_corr_grid <- left_join(my_corr_grid, lil_table,
+                          by = c('a', 'd'))
+
+## add P(D = 1|a)
+my_corr_grid <- left_join(my_corr_grid, lil_table %>% 
+                            filter(d == 1) %>% 
+                            rename(p1a = denom) %>% 
+                            dplyr::select(a, p1a),
+                          by = 'a')
+
+## add p1
+my_corr_grid$p <- parameters$p
+
+## calculate best (exact)
+my_corr_grid$best <- 1:nrow(my_corr_grid) %>% sapply(function(i){
+ mu_X_D(X = my_corr_grid[i, 'x'],
+        d = my_corr_grid[i, 'd'],
+        params = parameters)
+})
+
+message2 <- paste0('Computing F_S|D')
+print(message2)
+## calculate F(S|D)
+my_corr_grid$u <- 1:nrow(my_corr_grid) %>% sapply(function(i){
+  message <- paste0(i, '/', nrow(my_corr_grid), ': ',
+  'a = ', my_corr_grid[i, 'a'],
+  ', d = ', my_corr_grid[i, 'd'],
+  ', x = ', round(my_corr_grid[i, 'x'], 1))
+  print(message)
+  ## one u only 
+  estimate_cdf(s = my_corr_grid[i, 'best'],
+                        d = my_corr_grid[i, 'd'],
+                        a = my_corr_grid[i, 'a'],
+               denominator = my_corr_grid[i, 'denom'],
+                        params = parameters)
+})
+
+my_corr_grid <- my_corr_grid %>% 
+  filter(u > 1e-6, u <= 1 - 1e-6)
+
+message3 <- paste0('Transporting to D=0')
+print(message3)
+my_corr_grid$moved0 <- 1:nrow(my_corr_grid) %>% sapply(function(i){
+  message <- paste0(i, '/', nrow(my_corr_grid), ': ',
+  'a = ', my_corr_grid[i, 'a'],
+  ', u = ', round(my_corr_grid[i, 'u'], 2),
+  ', d = ', my_corr_grid[i, 'd'],
+  ', x = ', round(my_corr_grid[i, 'x'], 1))
+  print(message)
+  
+  the_denom0 <- precompute_denominator(d = 0,
+                                  a = my_corr_grid[i, 'a'],
+                                  params = parameters)
+  quantile_function(prob = my_corr_grid[i, 'u'],
+                    d = 0, a = my_corr_grid[i, 'a'],
+                    params = parameters,
+                      denominator = the_denom0)
+
+})
+
+message4 <- paste0('Transporting to D=1')
+print(message4)
+my_corr_grid$moved1 <- 1:nrow(my_corr_grid) %>% sapply(function(i){
+  message <- paste0(i, '/', nrow(my_corr_grid), ': ',
+  'a = ', my_corr_grid[i, 'a'],
+  ', u = ', round(my_corr_grid[i, 'u'], 2),
+  ', d = ', my_corr_grid[i, 'd'],
+  ', x = ', round(my_corr_grid[i, 'x'], 1))
+  print(message)
+  
+  the_denom1 <- precompute_denominator(d = 1,
+                                  a = my_corr_grid[i, 'a'],
+                                  params = parameters)
+  quantile_function(prob = my_corr_grid[i, 'u'],
+                    d = 1, a = my_corr_grid[i, 'a'],
+                    params = parameters,
+                      denominator = the_denom1)
+
+})
+
+
+my_corr_grid$corr_ptf <- with(my_corr_grid, moved0 * (1 - p1a) +
+                                moved1 * p1a)
+
+my_corr_grid$corr_mprop <- with(my_corr_grid, moved0 * (1 - p) +
+                                moved1 * p)
+
+return(my_corr_grid)
+}
+```
+
+### The corrective building
+
+(focus on the long calculus to get the corrective table per insurer.)
+```{r}
+## long...
+file_corrective  <- 'preds/corrective_tables.json'
+folder_path <- "preds/"
+
+if (!dir.exists(folder_path)) {
+  dir.create(folder_path, recursive = TRUE)
+}
+
+
+
+if(file.exists(file_corrective)){ # load
+  the_corr_grids_temp <- jsonlite::fromJSON(file_corrective)
+} else { # simulate and write
+  
+  the_corr_grids_temp <- setNames(nm = names(parms)[1:3]) %>%
+  lapply(function(pop_name){
+    grid <- make_corr_theo_grid(scenario_name = pop_name)
+    return(grid)
+  })
+  the_corr_grids_temp %>% jsonlite::toJSON(., pretty = TRUE) %>% write(file_corrective)
+}
+```
+
+Add market expected premiums. 
+
+```{r}
+the_corr_grids <- setNames(nm = names(the_corr_grids_temp)) %>% lapply(function(grid_name){
+    
+  grid <- the_corr_grids_temp[[grid_name]]
+    
+    ## add propensity to end up with insurer 1
+    grid$pA1_XD <- sapply(1:nrow(grid), function(i){
+      pAa_XD_fun(a = 1,
+                 x = grid[i, 'x'],
+                 d = grid[i, 'd'],
+                 params = parms[[grid_name]])
+    })
+      
+    ## play around with the format of the table
+    grid2 <- grid  %>% 
+      dplyr::select(pA1_XD, x, d, a, p, corr_ptf) %>%
+      dplyr::filter(a != 2) %>% 
+  pivot_wider(names_from = a,
+              values_from = corr_ptf,
+              names_prefix = 'a')
+    
+    ## create E_A(mu^C(x, d|A)|x, d)
+    grid2$mark_exp_corr <- grid2[["a0"]] * (1 - grid2$pA1_XD) + grid2[["a1"]] * grid2$pA1_XD
+    
+    grid3 <- grid  %>% 
+      dplyr::select(pA1_XD, x, d, a, p, corr_mprop) %>%
+      dplyr::filter(a != 2) %>% 
+  pivot_wider(names_from = a,
+              values_from = corr_mprop,
+              names_prefix = 'a')
+    
+    ## create E_A(mu^{C*}_A(x, d)|x, d)
+    grid3$mark_exp_corr_mprop <- grid3[["a0"]] * (1 - grid3$pA1_XD) + grid3[["a1"]] * grid3$pA1_XD
+    
+    ## left join to get the expected premium function of (x,d)
+    grid <- grid %>% left_join(., grid2 %>% 
+                         dplyr::select(x, d, mark_exp_corr),
+                       by = c('x', 'd'))
+    
+    ## left join to get the expected premium* function of (x,d)
+    grid <- grid %>% left_join(., grid3 %>% 
+                         dplyr::select(x, d, mark_exp_corr_mprop),
+                       by = c('x', 'd'))
+})
+
+```
+
+### Graphs
+
+```{r}
+(to_save_theo_corr_prem_marketprop_temp <- names(parms)[1:3] %>% 
+  lapply(function(pop_name){
+    premDat <- the_corr_grids[[pop_name]] %>% 
+      mutate(corr_ptf2 = corr_mprop,
+             best2 = best) %>% 
+      reshape2::melt(measure.vars = c('corr_mprop', 'best')) %>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'corr_ptf'][premDat$diff > 0.999] <- NA)  
+      
+    ## the colors
+    premDat$a <- factor(premDat$a)
+    levels(premDat$a) <- c("A=0", "A=1", "market")
+    
+    ## Make sure to keep the right order
+    premDat$a <- factor(premDat$a, levels=names(colors_for_gg_market)) 
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("$\\mu^{C *}_{A}$(x, d)")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+      
+    
+    premDat[c(which(premDat$variable=="corr_mprop"),
+              which(premDat$variable=="best"& premDat$a==2)),] %>%
+      ggplot(aes(x = x, y = value, col=factor(d), linetype=a,
+                 alpha=a, linewidth=a)) + 
+      geom_line() +
+      scale_color_manual(values = colors_for_gg_D, name = "d")+
+    scale_linetype_manual(values = c('solid','11','53'), name = "A")+
+       scale_linewidth_manual(values = c(1.2,  0.65, 0.50), name = 'A')+
+      scale_alpha_manual(values=c(0.25, 0.65, 0.8), name="A")+
+      theme_classic() +
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)+
+      scale_y_continuous(breaks = c(90, 110, 130),
+                         limits = c(80, 140)) + 
+      theme(plot.title = element_text(hjust=0.5))
+  }))
+ 
+ (to_save_theo_corr_prem_marketprop <- to_save_theo_corr_prem_marketprop_temp %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_prem_theo_corr_marketprop.pdf",
+       plot = to_save_theo_corr_prem_marketprop,
+       height = 2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+
+```{r}
+(to_save_theo_corr_prem_temp <- names(parms)[1:3] %>% 
+  lapply(function(pop_name){
+    premDat <- the_corr_grids[[pop_name]] %>% 
+      mutate(corr_ptf2 = corr_ptf,
+             best2 = best) %>% 
+      reshape2::melt(measure.vars = c('corr_ptf', 'best')) %>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'corr_ptf'][premDat$diff > 0.999] <- NA)  
+      
+    ## the colors
+    premDat$a <- factor(premDat$a)
+    levels(premDat$a) <- c("A=0", "A=1", "market")
+    
+    ## Make sure to keep the right order
+    premDat$a <- factor(premDat$a, levels=names(colors_for_gg_market)) 
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("$\\mu^C(x, d, A)$")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+      
+    
+    premDat[c(which(premDat$variable=="corr_ptf"),
+              which(premDat$variable=="best"& premDat$a==2)),] %>%
+      ggplot(aes(x = x, y = value, col=factor(d), linetype=a,
+                 alpha=a, linewidth=a)) + 
+      geom_line() +
+      scale_color_manual(values = colors_for_gg_D, name = "d")+
+    scale_linetype_manual(values = c('solid','12','53'), name = "A")+
+       scale_linewidth_manual(values = c(1.2,  0.65, 0.50), name = 'A')+
+      scale_alpha_manual(values=c(0.25, 0.65, 0.8), name="A")+
+      theme_classic() +
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)+
+      theme(plot.title = element_text(hjust=0.5)) + 
+      scale_y_continuous(breaks = c(90, 110, 130),
+                         limits = c(70, 150))
+    
+  }))
+ 
+ 
+ (to_save_theo_corr_prem <- to_save_theo_corr_prem_temp %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_prem_theo_corr.pdf",
+       plot = to_save_theo_corr_prem,
+       height = 2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+```{r}
+compute_conditional_cdfs <- function(params, s_values) {
+  
+  ## Extract parameters
+  gamma_0 <- params[['g_0']]
+  beta_0 <- params[['b_0']]
+  beta_x <- params[['b_x']]
+  beta_d <- params[['b_d']]
+  sigma_x <- params[['sd_X']]
+  rho <- params[['rho_xd']]
+  
+  ## Copula (X, D)
+  Phi <- pnorm(((s_values - beta_0) / beta_x - gamma_0)/sigma_x)
+  u <- matrix(c(rep(0.5, length(Phi)), Phi), byrow = FALSE, ncol = 2)
+  cop <- copula::pCopula(u, copula= copula::normalCopula(param = rho))
+  
+  ## Compute F_{S|D}(s|0)
+  compute_FSD <- function(d) {
+    if(d == 0){
+     to_return <- 2 * cop 
+    } else if(d == 1){
+      to_return <- 2 * (Phi - cop)
+    }
+    return(to_return)
+  }
+  
+  ## Apply to all s values
+  FSD_0_values <- compute_FSD(d = 0)
+  FSD_1_values <- compute_FSD(d = 1)
+  FSD_values <- (FSD_0_values + FSD_1_values)/2
+  
+  h <- s_values[2] - s_values[1]
+  
+  fSD_0_values <- c(0, (tail(FSD_0_values, -1) -  head(FSD_0_values, -1))/h)
+  fSD_1_values <- c(0, (tail(FSD_1_values, -1) -  head(FSD_1_values, -1))/h)
+  fSD_values <-c(0, (tail(FSD_values, -1) -  head(FSD_values, -1))/h)
+  
+  ## Return results as data frame
+  results <- data.frame('s' = s_values, 
+                        'FSD_0' = FSD_0_values, 
+                        'FSD_1' = FSD_1_values,
+                        'FSD' = FSD_values,
+                        'fSD_0' = fSD_0_values,
+                        'fSD_1' = fSD_1_values,
+                        'fSD' = fSD_values)
+  
+  return(results)
+}
+
+s_values <- seq(70, 135, by = 0.2)
+
+the_df <- compute_conditional_cdfs(params = parms$original, s_values)
+
+sapply(0:1, function(i){
+  lvls <- c('best', 'corr_ptf')
+  
+    premDat <- the_corr_grids[['original']] %>% 
+      mutate(corr_ptf2 = corr_ptf,
+             best2 = best) %>% 
+      reshape2::melt(measure.vars = lvls[1:(1 + i)]) %>%
+      mutate(diff = abs(d - ExpDgivenX('original', x)))
+
+
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'corr_ptf'][premDat$diff > 0.999] <- NA)  
+      
+    ## the colors
+    premDat$a <- factor(premDat$a)
+    levels(premDat$a) <- c("A=0", "A=1", "market")
+    
+    ## Make sure to keep the right order
+    premDat$a <- factor(premDat$a, levels=names(colors_for_gg_market)) 
+
+to_g_arrows <- premDat %>%
+  filter(a == 'market') %>% 
+  mutate(extreme = ((u < 0.06)&d==0)|((u > 0.93)&d==1)) 
+  
+
+
+  s_values <- the_df$s
+fSD_0_values <- the_df$fSD_0
+fSD_1_values <- the_df$fSD_1
+fSD_values <- the_df$fSD
+
+ if(i == 0){
+   the_arrows1 <- NULL
+    the_arrows2 <- NULL
+  } else {
+    the_arrows1 <- geom_segment(data = to_g_arrows %>% 
+                     filter(extreme),
+              aes(x = x, xend = x, y = best2, yend = corr_ptf2),
+                   arrow = arrow(length = unit(0.2, "cm")),
+              lwd = 0.6, lty = 1, alpha = 0.3)
+    
+    the_arrows2 <- geom_segment(data = data.frame(s = c(s_values[min(which(the_df$fSD_0 > 0.035))],
+                                                       s_values[max(which(the_df$fSD_1 > 0.035))]),
+                                                 d = c(0, 1),
+                                                 send = c(s_values[min(which(the_df$fSD > 0.035))],
+                                                       s_values[max(which(the_df$fSD > 0.035))]),
+                                                 dens = c(0.035, 0.035),
+                                                 densend = c(0.035, 0.035)),
+              aes(x = s, xend = send, y = dens, yend = densend),
+                   arrow = arrow(length = unit(0.2, "cm")),
+              lwd = 0.6, lty = 1, alpha = 0.6)
+  }
+  
+g1 <- to_g_arrows %>% 
+  mutate(variable = factor(variable,
+                           levels = lvls[1:(1 + i)])) %>% 
+      ggplot(aes(x = x, y = value, col=factor(d), linetype=factor(variable),
+                 alpha=factor(variable), linewidth=factor(d))) + 
+      geom_line() +
+      the_arrows1 +
+      scale_color_manual(values = colors_for_gg_D, name = "d")+
+    scale_linetype_manual(values = c(3, 1), name = "S(x, d)", labels = unname(c(latex2exp::TeX("$\\mu(x, d)$"), latex2exp::TeX("$\\mu^C(x, d)$")))) +
+       scale_linewidth_manual(values = c(1.1, 0.75), name = 'd') +
+      scale_alpha_manual(values=c(0.25, 1), name = 'S(x, d)', labels = unname(c(latex2exp::TeX("$\\mu(x, d)$"), latex2exp::TeX("$\\mu^C(x, d)$")))) +
+      theme_classic() +
+  labs(x = latex2exp::TeX("$x$"),
+       y = latex2exp::TeX("$S(x, d)$")) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)+
+      theme(plot.title = element_text(hjust=0.5))+
+  guides(
+    col = guide_legend(nrow = 2, order = 1),  # Control number of columns for consistency
+    linewidth = guide_legend(nrow = 2, order = 1),
+    lty = guide_legend(nrow = 2, order = 2),
+    alpha = guide_legend(nrow = 2, order = 2)
+  )
+
+
+g2 <- data.frame('d' = c(rep(0, length(s_values)),
+                   rep(1, length(s_values)),
+                   rep(0, length(s_values)),
+                   rep(1, length(s_values))),
+           'prem' = c(rep('best', length(s_values) * 2),
+                   rep('corr', length(s_values) * 2)),
+           'dens' = c(fSD_0_values, fSD_1_values,
+                      fSD_values, fSD_values),
+           's' = rep(s_values, 4))[1:(length(s_values) * 2 * (1 + i)), ] %>% 
+  ggplot(aes(x = s, y = dens, 
+             col=factor(d), 
+             linetype=factor(prem),
+             alpha=factor(prem),
+             linewidth=factor(d))) + 
+  geom_line(alpha = 0.5) + 
+  the_arrows2 + 
+  scale_color_manual(values = colors_for_gg_D, name = "d")+
+    scale_linetype_manual(values = c(3, 1), name = "S(x, d)", labels = unname(c(latex2exp::TeX("$\\mu(x, d)$"), latex2exp::TeX("$\\mu^C(x, d)$"))[1:(1 + i)])) +
+       scale_linewidth_manual(values = c(1.2, 0.6), name = 'd') +
+      scale_alpha_manual(values=c(0.35, 1), name = 'S(x, d)', labels = unname(c(latex2exp::TeX("$\\mu(x, d)$"), latex2exp::TeX("$\\mu^C(x, d)$"))[1:(1 + i)])) +
+      theme_classic() +
+  labs(x = latex2exp::TeX("$s$"),
+       y = latex2exp::TeX("$f_{S|D}(s|d)$")) + 
+      theme(plot.title = element_text(hjust=0.5)) +
+  guides(
+    col = guide_legend(nrow = 2, order = 1),  # Control number of columns for consistency
+    linewidth = guide_legend(nrow = 2, order = 1),
+    lty = guide_legend(nrow = 2, order = 2),
+    alpha = guide_legend(nrow = 2, order = 2)
+  )
+  
+  
+  ggpubr::ggarrange(g1, g2, common.legend = T,
+                    legend = 'right') %>% 
+ggsave(filename = paste0("figs/graph_corr_illustration_", i, ".pdf"),
+       plot = .,
+       height = 2.75,
+       width = 7,
+       units = "in",
+       device = "pdf", dpi = 500)
+})
+
+```
+
+
+## Plots
+
+We are ready to plot the theoretical curves.
+
+First, the unaware premiums:
+
+```{r graphunaware, echo=FALSE, fig.width=12, fig.height=4}
+
+
+(to_save_theo_unaware_prem <- names(parms)[1:3] %>% 
+  lapply(function(pop_name){
+    premDat <- grid_to_test2 %>% 
+      mutate(best = sapply(1:nrow(grid_to_test2), function(i){
+        BEfun(pop_name, x= grid_to_test2[i, 'x'],
+                 d = grid_to_test2[i, 'd'],
+                 a = grid_to_test2[i, 'a'])}),
+              un = sapply(1:nrow(grid_to_test2), function(i){
+        UNfun(pop_name,
+              x=grid_to_test2[i, 'x'],
+              d=grid_to_test2[i, 'd'],
+              a=grid_to_test2[i, 'a'])})) %>% 
+      reshape2::melt(measure.vars = c('best', 'un'))%>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+      
+      
+    ## the colors
+    premDat$a <- factor(premDat$a)
+    levels(premDat$a) <- c("A=0", "A=1", "market")
+    
+    ## Make sure to keep the right order
+    premDat$a <- factor(premDat$a, levels=names(colors_for_gg_market)) 
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Unaware Premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+      
+    
+    premDat[c(which(premDat$variable=="un"&premDat$d==1)),]%>%
+      ggplot(aes(x = x, y = value, col=a, linetype=a,
+                 alpha=variable, linewidth=factor(d))) + 
+      geom_line(data = premDat[c(which(premDat$variable=="best"&premDat$a=="market")),],
+                linetype = 1, color = 'black', alpha = 0.6) + 
+      geom_line() +
+      scale_color_manual(values = colors_for_gg_market, name = "A")+
+    scale_linetype_manual(values = c(1,3,2), name = "A")+
+       scale_linewidth_manual(values = setNames(c(1.2, 0.65), nm = c('0', '1')), name = 'd')+
+      scale_alpha_manual(values=c(0.8,0.9), guide="none")+
+      theme_classic() +
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)+
+      theme(plot.title = element_text(hjust=0.5))
+  }) %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_prem_theo_unaware.pdf",
+       plot = to_save_theo_unaware_prem,
+       height = 2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+Then the aware premiums. For the next graph, consider cutting the lines when Prob(A=a) is small.
+
+```{r graphaware, echo=FALSE, fig.width=12, fig.height=4}
+
+(to_save_theo_aware_prem <- names(parms)[1:3] %>% 
+  lapply(function(pop_name){
+    premDat <- grid_to_test2 %>% 
+      mutate(best = sapply(1:nrow(grid_to_test2), function(i){
+        BEfun(pop_name, x= grid_to_test2[i, 'x'],
+                 d = grid_to_test2[i, 'd'],
+                 a = grid_to_test2[i, 'a'])}),
+             aw = sapply(1:nrow(grid_to_test2), function(i){
+        AWfun(pop_name,
+              x=grid_to_test2[i, 'x'],
+              d=grid_to_test2[i, 'd'],
+              a=grid_to_test2[i, 'a'])})) %>% 
+      reshape2::melt(measure.vars = c('best', 'aw'))%>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+      
+      
+    ## the colors
+    premDat$a <- factor(premDat$a)
+    levels(premDat$a) <- c("A=0", "A=1", "market")
+    
+    ## Make sure to keep the right order
+    premDat$a <- factor(premDat$a, levels=names(colors_for_gg_market)) 
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Aware Premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+      
+    
+    premDat[c(which(premDat$variable=="aw"&premDat$d==1)),]%>%
+      ggplot(aes(x = x, y = value, col=a, linetype=a,
+                 alpha=variable, linewidth=factor(d))) + 
+      geom_line(data = premDat[c(which(premDat$variable=="best"&premDat$a=="market")),],
+                linetype = 1, color = 'black', alpha = 0.6) + 
+      geom_line() +
+      scale_color_manual(values = colors_for_gg_market, name = "A")+
+    scale_linetype_manual(values = c(1,3,2), name = "A")+
+       scale_linewidth_manual(values = setNames(c(1.2, 0.65), nm = c('0', '1')), name = 'd')+
+      scale_alpha_manual(values=c(0.8,0.9), guide="none")+
+      theme_classic() +
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)+
+      theme(plot.title = element_text(hjust=0.5))
+  }) %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_prem_theo_aware.pdf",
+       plot = to_save_theo_aware_prem,
+       height = 2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+Plot for graphical abstract scenario A only
+
+```{r graphawareScA, echo=FALSE, fig.width=12, fig.height=4}
+
+
+  
+  pop_name <- names(parms)[1]
+
+    premDat <- grid_to_test2 %>% 
+      mutate(best = sapply(1:nrow(grid_to_test2), function(i){
+        BEfun(pop_name, x= grid_to_test2[i, 'x'],
+                 d = grid_to_test2[i, 'd'],
+                 a = grid_to_test2[i, 'a'])}),
+             aw = sapply(1:nrow(grid_to_test2), function(i){
+        AWfun(pop_name,
+              x=grid_to_test2[i, 'x'],
+              d=grid_to_test2[i, 'd'],
+              a=grid_to_test2[i, 'a'])})) %>% 
+      reshape2::melt(measure.vars = c('best', 'aw'))%>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+  
+
+    ## the colors
+    premDat$a <- factor(premDat$a)
+    levels(premDat$a) <- c("A=0", "A=1", "market")
+    
+    ## Make sure to keep the right order
+    premDat$a <- factor(premDat$a, levels=names(colors_for_gg_market)) 
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+premDat <- premDat[c(which(premDat$variable=="aw"&premDat$d==1),
+              which(premDat$variable=="best"&premDat$a=="market")),]
+
+newlab <- as.integer(premDat$a)
+newlab[which(premDat$variable=="best")] <- 4+premDat$d[which(premDat$variable=="best")]
+
+newlab <- factor(newlab)
+levels(newlab) <- c(levels(premDat$a), c("E(Y|x,d=0)", "E(Y|x,d=1)"))
+
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Aware Premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+
+premDat$newlab <- newlab
+    
+(to_save_theo_aware_prem_ScA <- 
+      ggplot(premDat, aes(x = x, y = value, col=newlab, linetype=newlab, linewidth=newlab)) + 
+      geom_line() +
+      scale_color_manual(values = c(unname(colors_for_gg_market),"black", "black"), name = "")+
+    scale_linetype_manual(values = c(1,3,2,1,4), name = "")+
+    scale_linewidth_manual(values = c(1, 1,1,1.1,1.1), name = '')+
+      theme_classic() +
+  labs(x = the_x_label,
+       y = the_y_label) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)+
+  theme(panel.background=element_rect(fill="transparent"),
+        plot.background = element_rect(fill='transparent', color=NA),
+        legend.background = element_rect(fill='transparent'),
+        legend.position=c(0.9,0.3),
+  plot.margin=margin(5.5,30,5.5,5.5)))
+  
+
+ggsave(filename = "figs/graph_theo_aware_prem_ScA.pdf",
+       plot = to_save_theo_aware_prem_ScA,
+       height = 2.9,
+       width = 3,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+### Expected premiums
+
+Now, we consider the expected price from the perspective of the insured, given D=0 or D=1.
+
+```{r expectedpremfun}
+
+pAgivenXD <- function(x,d,a, param){
+   a_0 <- -1 * sum(param[['a_x']]*param[['g_0']] + param[['a_d']] * param[['p']])
+ 
+(exp(a_0+param[['a_x']]*x+param[['a_d']]*d))^(a==1)/(1+exp(a_0+param[['a_x']]*x+param[['a_d']]*d))
+}
+
+un_fun_market <- function(pop_name, x, d){
+  param <- parms[[pop_name]]
+  pAgivenXD(x, d, 1, param) * UNfun(pop_name,x=x, d=d, a=1) +
+  pAgivenXD(x, d, 0, param) * UNfun(pop_name,x=x, d=d, a=0)
+}
+
+aw_fun_market <- function(pop_name, x, d){
+  param <- parms[[pop_name]]
+  pAgivenXD(x, d, 1, param) * AWfun(pop_name, x=x, d=d, a=1) +
+  pAgivenXD(x, d, 0, param) * AWfun(pop_name, x=x, d=d, a=0)
+}
+```
+
+We can plot everything on the same graph.
+
+```{r graphblackandwhite, fig.height=4, fig.width=10, echo=FALSE}
+(to_save_theo_prem_fullpop <- names(parms)[names(parms) %in% c("original", "neutral", "noDtoA")] %>% 
+  lapply(function(pop_name){
+    short_grid <- grid_to_test2 %>% 
+      filter(a == 1)
+    
+    premDat <- short_grid %>% 
+      mutate(best = sapply(1:nrow(short_grid), function(i){
+        BEfun(pop_name,
+              x=short_grid[i, 'x'],
+              d=short_grid[i, 'd'],
+                a=1)}),
+        un = sapply(1:nrow(short_grid), function(i){
+        un_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                 d=short_grid[i, 'd'])}),
+        aw = sapply(1:nrow(short_grid), function(i){
+        aw_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                      d=short_grid[i, 'd'])})) %>% 
+      reshape2::melt(measure.vars = c('best', 'un', 'aw'))
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Premium")
+      the_y_scale <- scale_y_continuous()
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(labels = NULL)
+      the_x_label <- latex2exp::TeX("x")
+    }
+      
+      
+    premDat %>% ggplot(aes(x = x, y = value,
+               col = variable,
+               lty = factor(d),
+             linewidth = factor(d),
+               )) + 
+      geom_line(alpha = 0.75) + 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)  + # see above
+      the_y_scale +
+  theme_minimal()+
+  theme(plot.title = element_text(hjust=0.5))+
+  scale_color_manual(values = c('black', head(gray.colors(3), 2)), name = "A") +
+  scale_linetype_manual(values = c(1, 2), name = "d") +
+  scale_linewidth_manual(values = c(1, 0.55), name = 'd') 
+  }) %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_prem_theo_fullpop.pdf",
+       plot = to_save_theo_prem_fullpop,
+       height = 3,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+We can try something more lively.
+
+```{r graphlively, fig.height=4, fig.width=10, echo=FALSE}
+(to_save_theo_expected_prem <- names(parms)[names(parms) %in% c("original", "neutral", "noDtoA")] %>% 
+  lapply(function(pop_name){
+    short_grid <- grid_to_test2 %>% 
+      filter(a == 1)
+    
+    the_corr_grid <- the_corr_grids[[pop_name]]
+    
+    premDat <- short_grid %>% 
+      mutate(x = round(x, 4), 
+             best = sapply(1:nrow(short_grid), function(i){
+        BEfun(pop_name,
+              x=short_grid[i, 'x'],
+              d=short_grid[i, 'd'],
+                a=1)}),
+        un = sapply(1:nrow(short_grid), function(i){
+        un_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                 d=short_grid[i, 'd'])}),
+        aw = sapply(1:nrow(short_grid), function(i){
+        aw_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                      d=short_grid[i, 'd'])})) %>% 
+      left_join(., the_corr_grid %>% 
+      dplyr::select(x, d, mark_exp_corr) %>% 
+        mutate(x = round(x, 4)), 
+      by = c('x', 'd')) %>% 
+      mutate(corr = mark_exp_corr) %>% 
+      dplyr::select(-mark_exp_corr) %>% 
+      reshape2::melt(measure.vars = c('best', 'un', 'aw', 'corr'))%>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'un'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'aw'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'corr'][premDat$diff > 0.999] <- NA)
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Premium")
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+    }
+      
+      
+    premDat %>% 
+      filter(variable != 'corr') %>% 
+      ggplot(aes(x = x, y = value,
+               col = variable,
+               lty = factor(d),
+             linewidth = factor(d),
+             alpha=factor(d),
+               )) + 
+      geom_line() + 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)  + # see above
+      the_y_scale +
+  theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))+
+  scale_color_manual(values = colors_for_gg_premium, name = "Premium") +
+  scale_linetype_manual(values = c(1, 2), name = "d") +
+  scale_linewidth_manual(values = c(1, 0.55), name = 'd')+
+  scale_alpha_manual(values=c(0.5,1), name="d")
+  }) %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_theo_expected_prem.pdf",
+       plot = to_save_theo_expected_prem,
+       height = 2.75, #2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+```{r graphlively2, fig.height=4, fig.width=10, echo=FALSE}
+(to_save_theo_expected_prem2 <- names(parms)[names(parms) %in% c("original", "neutral", "noDtoA")] %>% 
+  lapply(function(pop_name){
+    short_grid <- grid_to_test2 %>% 
+      filter(a == 1)
+    
+    the_corr_grid <- the_corr_grids[[pop_name]]
+    
+    premDat <- short_grid %>% 
+      mutate(x = round(x, 4), 
+             best = sapply(1:nrow(short_grid), function(i){
+        BEfun(pop_name,
+              x=short_grid[i, 'x'],
+              d=short_grid[i, 'd'],
+                a=1)}),
+        un = sapply(1:nrow(short_grid), function(i){
+        un_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                 d=short_grid[i, 'd'])}),
+        aw = sapply(1:nrow(short_grid), function(i){
+        aw_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                      d=short_grid[i, 'd'])})) %>% 
+      left_join(., the_corr_grid %>% 
+      dplyr::select(x, d, mark_exp_corr) %>% 
+        mutate(x = round(x, 4)), 
+      by = c('x', 'd')) %>% 
+      mutate(corr = mark_exp_corr) %>% 
+      dplyr::select(-mark_exp_corr) %>% 
+      reshape2::melt(measure.vars = c('best', 'un', 'aw', 'corr'))%>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'un'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'aw'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'corr'][premDat$diff > 0.999] <- NA)
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Premium")
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+    }
+      
+      
+    premDat %>% 
+      mutate(d = factor(d, levels = 1:0, 
+                        labels = c('d = 1', 'd = 0'))) %>% 
+      ggplot(aes(x = x, y = value,
+               col = variable,
+               lty = factor(d),
+             linewidth = factor(d),
+             alpha=factor(d),
+               )) + 
+      geom_line() + 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)  + # see above
+      the_y_scale +
+  theme_classic()+
+    facet_grid(rows = vars(d)) + 
+  theme(plot.title = element_text(hjust=0.5))+
+  scale_color_manual(values = colors_for_gg_premium, name = "Premium") +
+  scale_linetype_manual(values = c(1, 2), name = "d") +
+  scale_linewidth_manual(values = c(1, 0.55), name = 'd')+
+  scale_alpha_manual(values=c(0.5,1), name="d")
+  }) %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_theo_expected_prem2.pdf",
+       plot = to_save_theo_expected_prem2,
+       height = 3.75, #2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+
+```{r graphlively3, fig.height=4, fig.width=10, echo=FALSE}
+(to_save_theo_expected_prem3_temp <- names(parms)[names(parms) %in% c("original", "neutral", "noDtoA")] %>% 
+  lapply(function(pop_name){
+    
+    the_corr_grid <- the_corr_grids[[pop_name]]
+    
+    premDat <- the_corr_grid %>% 
+      filter(a == 2) %>% 
+      reshape2::melt(measure.vars = c('corr_ptf',
+                                      'mark_exp_corr_mprop', 'mark_exp_corr'))%>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x))
+             )
+    
+    labels_for_the_corrs <- unname(latex2exp::TeX(c('$\\mu^C(x, d)$',
+                                                                '${E_A}\\{\\mu^{C *}_A(x, d)|x, d\\}$', '${E_A} \\{\\mu^C(x, d,A)|x, d\\}$')
+                                                              ))
+      
+    suppressWarnings(premDat$value[premDat$variable == 'corr_ptf'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'mark_exp_corr'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'mark_exp_corr_mprop'][premDat$diff > 0.999] <- NA)
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Premium")
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+    }
+      
+      
+    premDat %>% 
+      mutate(d = factor(d, levels = 1:0, 
+                        labels = c('1', '0'))) %>% 
+      ggplot(aes(x = x, y = value,
+               col = factor(d),
+               lty = variable,
+             linewidth = variable,
+             alpha=variable,
+               )) + 
+      geom_line() + 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])
+       ) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)  + # see above
+      the_y_scale +
+  theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))+
+  scale_color_manual(values = setNames(colors_for_gg_D, nm = c('0', '1')), name = "d") +
+  scale_linetype_manual(values = c('solid', '93', '11'), name = "Premium", labels = labels_for_the_corrs) +
+  scale_linewidth_manual(values = c(1.2,  0.65, 0.50), name = 'Premium', labels =labels_for_the_corrs)+
+  scale_alpha_manual(values=c(0.25, 0.65, 0.8), name="Premium", labels =labels_for_the_corrs)
+  })) 
+ 
+(to_save_theo_expected_prem3 <-  to_save_theo_expected_prem3_temp %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_theo_expected_prem3.pdf",
+       plot = to_save_theo_expected_prem3,
+       height = 2.75, #2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+
+```{r graphlively4, fig.height=4, fig.width=10, echo=FALSE}
+(to_save_theo_expected_prem4 <- names(parms)[names(parms) %in% c("original", "neutral", "noDtoA")] %>% 
+  lapply(function(pop_name){
+    short_grid <- grid_to_test2 %>% 
+      filter(a == 1)
+    
+    the_corr_grid <- the_corr_grids[[pop_name]]
+    
+    premDat <- short_grid %>% 
+      mutate(x = round(x, 4), 
+             best = sapply(1:nrow(short_grid), function(i){
+        BEfun(pop_name,
+              x=short_grid[i, 'x'],
+              d=short_grid[i, 'd'],
+                a=1)}),
+        un = sapply(1:nrow(short_grid), function(i){
+        un_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                 d=short_grid[i, 'd'])}),
+        aw = sapply(1:nrow(short_grid), function(i){
+        aw_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                      d=short_grid[i, 'd'])})) %>% 
+      left_join(., the_corr_grid %>% 
+      dplyr::select(x, d, mark_exp_corr) %>% 
+        mutate(x = round(x, 4)), 
+      by = c('x', 'd')) %>% 
+      mutate(corr = mark_exp_corr) %>% 
+      dplyr::select(-mark_exp_corr) %>% 
+      reshape2::melt(measure.vars = c('best', 'un', 'aw', 'corr'))%>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'un'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'aw'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'corr'][premDat$diff > 0.999] <- NA)
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Premium")
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+    }
+      
+      
+    premDat %>% 
+      mutate(d = factor(d, levels = 1:0, 
+                        labels = c('d = 1', 'd = 0'))) %>% 
+      ggplot(aes(x = x, y = value,
+               col = variable,
+               lty = factor(d),
+             linewidth = factor(d),
+             alpha=factor(d),
+               )) + 
+      geom_line() + 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)  + # see above
+      the_y_scale +
+  theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))+
+  scale_color_manual(values = colors_for_gg_premium, name = "Premium") +
+  scale_linetype_manual(values = c(1, 2), name = "d") +
+  scale_linewidth_manual(values = c(1, 0.55), name = 'd')+
+  scale_alpha_manual(values=c(0.5,1), name="d")
+  }) %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_theo_expected_prem4.pdf",
+       plot = to_save_theo_expected_prem4,
+       height = 2.75, #2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+```{r graphlively5, fig.height=4, fig.width=10, echo=FALSE}
+(to_save_theo_expected_prem5_temp <- names(parms)[names(parms) %in% c("original", "neutral", "noDtoA")] %>% 
+  lapply(function(pop_name){
+    
+    the_corr_grid <- the_corr_grids[[pop_name]]
+    
+    
+    premDat <- short_grid %>% 
+      mutate(x = round(x, 4), 
+             best = sapply(1:nrow(short_grid), function(i){
+        BEfun(pop_name,
+              x=short_grid[i, 'x'],
+              d=short_grid[i, 'd'],
+                a=1)}),
+        un = sapply(1:nrow(short_grid), function(i){
+        un_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                 d=short_grid[i, 'd'])}),
+        aw = sapply(1:nrow(short_grid), function(i){
+        aw_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                      d=short_grid[i, 'd'])})) %>% 
+      left_join(., the_corr_grid %>% 
+      filter(a == 2) %>% 
+      dplyr::select(x, d, mark_exp_corr, corr_ptf) %>% 
+        mutate(x = round(x, 4)), 
+      by = c('x', 'd')) %>% 
+      reshape2::melt(measure.vars = c('corr_ptf' , 'mark_exp_corr','best'))%>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$diff > 0.999] <- NA)
+    
+    labels_for_the_corrs <- unname(latex2exp::TeX(c('$\\mu^C(x, d)$', '$\\pi_{corrective}(x, d)$', '$\\mu(x, d)$' )
+                                                              ))
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Premium")
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+    }
+      
+      
+    premDat %>% 
+      ggplot(aes(x = x, y = value,
+               col = factor(d),
+               lty = variable,
+             linewidth = variable,
+             alpha=variable,
+               )) + 
+      geom_line() + 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = c(-3:3)*3 + 1)  + # see above
+      the_y_scale +
+  theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))+
+  scale_color_manual(values = setNames(colors_for_gg_D, nm = c('0', '1')), name = "d") +
+  scale_linetype_manual(values = c('solid', '93', '11'), name = "Premium", labels = labels_for_the_corrs) +
+  scale_linewidth_manual(values = c(1.2,  0.65, 0.50), name = 'Premium', labels =labels_for_the_corrs)+
+  scale_alpha_manual(values=c(0.25, 0.65, 0.8), name="Premium", labels =labels_for_the_corrs)
+  }))
+
+to_save_theo_expected_prem5 <- to_save_theo_expected_prem5_temp %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right')
+
+ggsave(filename = "figs/graph_theo_expected_prem5.pdf",
+       plot = to_save_theo_expected_prem5,
+       height = 2.75, #2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+
+```{r}
+
+library(gtable)
+library(grid)
+
+for (i in 1:3) {
+  g <- (to_save_theo_corr_prem_temp[[1]] + guides(linewidth = 'none', alpha = 'none', linetype = 'none') + theme(legend.position = 'right')) %>% 
+                      ggplotGrob(.)
+# Extract all guide-boxes
+legend_boxes <- g$grobs[sapply(g$grobs, function(x) x$name) == "guide-box"]
+
+legend <- ggplot() + 
+    theme_void() +
+    annotation_custom(legend_boxes[[1]])
+
+ggpubr::ggarrange(plotlist = list(to_save_theo_corr_prem_temp[[i]]+
+  theme(legend.position = "bottom", legend.direction = "vertical") + labs(title = '')+ 
+     guides(color = 'none') + 
+    ylab(latex2exp::TeX('$\\mu^C(x, d, A)$')),
+  
+                                  to_save_theo_corr_prem_marketprop_temp[[i]]+
+  theme(legend.position = "bottom", legend.direction = "vertical")+ labs(title = '')+ 
+     guides(color = 'none') + 
+    ylab(latex2exp::TeX('$\\mu^{C*}_{A}(x, d)$')),
+  
+                                  to_save_theo_expected_prem5_temp[[i]]+
+  theme(legend.position = "bottom", legend.direction = "vertical")+ labs(title = '') + 
+     guides(color = 'none')+ 
+    ylab(latex2exp::TeX('$Premium$')),
+  legend),
+                  ncol = 4, widths = c(3, 3, 3, 1)) %>% 
+  ggsave(filename = paste0("figs/graph_theo_corr_vertical_", i, ".pdf"),
+       plot = .,
+       height = 3.75, #2.75,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+}
+
+
+
+```
+
+Scenario A only for the third panel of the graphical abstract
+
+```{r graphlivelyScA, fig.height=4, fig.width=10, echo=FALSE}
+
+pop_name <- names(parms)[1]
+
+
+    
+    short_grid <- grid_to_test2 %>% 
+      filter(a == 1)
+
+    
+    premDat <- short_grid %>% 
+      mutate(x = round(x, 4), 
+             best = sapply(1:nrow(short_grid), function(i){
+        BEfun(pop_name,
+              x=short_grid[i, 'x'],
+              d=short_grid[i, 'd'],
+                a=1)}),
+        aw = sapply(1:nrow(short_grid), function(i){
+        aw_fun_market(pop_name,
+                      x=short_grid[i, 'x'],
+                      d=short_grid[i, 'd'])})) %>% 
+      reshape2::melt(measure.vars = c('best', 'aw'))%>%
+      mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+    
+    suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+    suppressWarnings(premDat$value[premDat$variable == 'aw'][premDat$diff > 0.999] <- NA)
+    
+    pop_id <- which(names(sims) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(sims)) == 1){
+      the_y_label <- latex2exp::TeX("Premium")
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(breaks = c(90, 110, 130)) 
+      the_x_label <- latex2exp::TeX("x")
+    }
+      
+      
+(to_save_theo_expected_prem_ScA <-     premDat %>% 
+      ggplot(aes(x = x, y = value,
+               col = variable,
+               lty = factor(d),
+               linewidth=variable
+               )) + 
+      geom_line() + 
+  labs(x = the_x_label,
+       y = the_y_label) + 
+      scale_x_continuous(breaks = c(-3:4)*3 + 1)  + # see above
+      scale_y_continuous(breaks = c(80, 100,120, 140))  +
+  theme_classic()+
+  scale_color_manual(values = colors_for_gg_premium, name = "Premium", labels=c("E(Y|x,d)","Aware")) +
+  scale_linetype_manual(values = c(1, 4), name = "", 
+                        labels=c("d=0","d=1")) +
+  scale_linewidth_manual(values = c(1.1,1), name = 'Premium',
+                         labels=c("E(Y|x,d)","Aware"))+
+  theme(panel.background=element_rect(fill="transparent"),
+        plot.background = element_rect(fill='transparent', color=NA),
+        legend.background = element_rect(fill='transparent'),
+        legend.position=c(1,0.35),
+  plot.margin=margin(5.5,30,5.5,5.5)))
+
+ggsave(filename = "figs/graph_theo_expected_prem_ScA.pdf",
+       plot = to_save_theo_expected_prem_ScA,
+       height = 2.9,
+       width = 3,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+
+
+```
+
+## Graph for presentations
+
+This is the code for the version of the graph we use for presentations. A ARRANGER CAR NE ROULE PAS MAINTENANT.
+
+```{r graphforpres, echo=FALSE}
+the_bias_colors <- c('black', '#9966CC', "#AEAEAE", '#F7798D')
+the_bias_labels <- unname(TeX(c("$\\mu^{P}(x, d)$   ", "$\\mu^{U}(x)$", "$\\mu^{C}(x)$", '$\\mu^{M, C}(x, d)$')))
+the_bias_premiums <- c('best', 'un', 'aw_market', 'aw_by_ins')
+    
+
+# to_save_theo_aw_by_pop <- seq_along(the_bias_colors) %>% 
+#   lapply(function(the_number){
+#     
+#     pop_name = 'original'
+#     
+#     short_grid <- grid_to_test2 %>% 
+#       filter(a == 'A=1')
+#     
+#     
+#     premDat <- short_grid %>% 
+#       mutate(best = sapply(1:nrow(short_grid), function(i){
+#         best_fun(short_grid[i, 'x'],
+#                  short_grid[i, 'd'],
+#                  1,
+#                  parms[[pop_name]])}),
+#         aw_market = sapply(1:nrow(short_grid), function(i){
+#         aw_fun(x = short_grid[i, 'x'],
+#               d = short_grid[i, 'd'],
+#               a = 'market', 
+#               param = parms[[pop_name]])}),
+#         un = sapply(1:nrow(short_grid), function(i){
+#         un_fun(x = short_grid[i, 'x'],
+#               d = short_grid[i, 'd'],
+#               a = 'market',
+#                  parms[[pop_name]])}),
+#               aw_market = sapply(1:nrow(short_grid), function(i){
+#         aw_fun(x = short_grid[i, 'x'],
+#               d = short_grid[i, 'd'],
+#               a = 'market', 
+#               param = parms[[pop_name]])}),
+#             aw_by_ins = sapply(1:nrow(short_grid), function(i){
+#         aw_fun_market(short_grid[i, 'x'],
+#                  short_grid[i, 'd'],
+#                  parms[[pop_name]])})) %>% 
+#       reshape2::melt(measure.vars = the_bias_premiums[seq(the_number)]) %>% 
+#       mutate(diff = abs(d - ExpDgivenX(pop_name, x)))
+#     
+#     suppressWarnings(premDat$value[premDat$variable == 'best'][premDat$diff > 0.999] <- NA)
+#     
+#     pop_id <- which(names(sims) == pop_name)
+#     
+#     # keep only axis for last plot
+#     if(which(pop_name == names(sims)) == 1){
+#       the_y_label <- latex2exp::TeX("Valeur de la prime")
+#       the_y_scale <- scale_y_continuous()
+#       the_x_label <- latex2exp::TeX("x")
+#       } else { 
+#       the_y_label <- NULL
+#       the_y_scale <- scale_y_continuous(labels = NULL)
+#       the_x_label <- latex2exp::TeX("x")
+#     }
+#       
+#     to_save_theo_aw_by_pop <- premDat %>% 
+#       filter(x > -9) %>% 
+#       ggplot(aes(x = x, y = value,
+#                col = variable,
+#                lty = factor(d),
+#              linewidth = factor(d),
+#                )) + 
+#       geom_line(alpha = 0.65) + 
+#   labs(x = the_x_label,
+#        y = the_y_label
+#        # ,title = latex2exp::TeX(long_labels_for_parms[pop_id])
+#        ) + 
+#       scale_x_continuous(breaks = c(-3:3)*3 + 1)  + # see above
+#       the_y_scale +
+#   theme_classic()+
+#   coord_fixed(ratio = 1/3.8) + 
+#   theme(plot.title = element_text(hjust=0.5),
+#         plot.margin = unit(c(0.0, 0.0, 0.0, 0.0), "in"))+
+#   scale_color_manual(values = the_bias_colors, name = "Prime",
+#                      labels = the_bias_labels) +
+#   scale_linetype_manual(values = c(1, 2), name = "d") +
+#   scale_linewidth_manual(values = c(1, 0.55), name = 'd') +
+#       theme(legend.position = 'bottom', legend.box="horizontal",
+#             legend.direction = 'vertical')+
+#   guides(
+#     col = guide_legend(nrow = 4, order = 1),  # Control number of columns for consistency
+#     lty = guide_legend(nrow = 4, order = 2),
+#     linewidth = guide_legend(nrow = 4, order = 2)
+#   )
+#     
+#     
+#   ggsave(filename = paste0("figs/graph_theo_aw_by_pop", the_number, "_base.pdf"),
+#        plot = to_save_theo_aw_by_pop,
+#        height = 4,
+#        width = 2.8,
+#        units = "in",
+#        device = "pdf", dpi = 500)
+#   }) 
+
+```
+
+
+# The models
+
+In this section, we estimate the models based on the complete market and on the separate Insurer portfolios. 
+
+## Best-estimate
+
+```{r bemodel, cache=TRUE}
+source('___lgb_best_estimate.R')
+
+## clean the pred repo
+unlink(file.path('preds', "*_best_estimate.json"))
+best_lgb <- setNames(nm = names(sims)) %>% lapply(the_best_estimate_lightgbm_fun)
+
+```
+
+
+Fit LightGBM BE model for each of the two portfolios: they should both be unbiased. From the graph, it seems to work just fine.
+
+```{r bemodelptf, cache=TRUE, fig.width=10, fig.height=8}
+best_lgb_A1 <- setNames(nm = names(sims)) %>% lapply(the_best_estimate_lightgbm_fun, selectA=1)
+best_lgb_A0 <- setNames(nm = names(sims)) %>% lapply(the_best_estimate_lightgbm_fun, selectA=0)
+
+par(mfrow=c(2,3))
+lapply(names(sims), function(pop_name){
+plot(best_lgb[[pop_name]]$preds$valid[valid[[pop_name]]$A==0], best_lgb_A0[[pop_name]]$preds$valid, col=colors_for_gg_A[1], xlab="Market prediction", ylab="Portfolio prediction", ylim=c(80,140), xlim=c(80,140), main=long_labels_for_parms[pop_name])
+points(best_lgb[[pop_name]]$preds$valid[valid[[pop_name]]$A==1], best_lgb_A1[[pop_name]]$preds$valid, col=colors_for_gg_A[2])
+})
+```
+
+
+## Marginal model for D
+
+```{r margd}
+(marg_dist <- sims %>% lapply(function(data){
+  data$D %>% table %>%  prop.table
+}))
+
+(marg_dist_A0 <- sims %>% lapply(function(data){
+  data$D[which(data$A==0)] %>% table %>%  prop.table
+}))
+
+(marg_dist_A1 <- sims %>% lapply(function(data){
+  data$D[which(data$A==1)]  %>% table %>%  prop.table
+}))
+```
+
+
+## Conditional dist of D|X
+
+```{r pdxmodel, cache=TRUE}
+source('___lgb_pdx_estimate.R') 
+
+## clean the preds repo
+unlink(file.path('preds', "*_pdx.json"))
+pdx_lgb <- setNames(nm = names(sims)) %>% lapply(the_pdx_lightgbm_fun)
+```
+
+Run pdx for each of the two portfolios: they will differ.
+
+```{r pdxmodelptf, cache=TRUE, fig.width=10, fig.height=8}
+pdx_lgb_A1 <- setNames(nm = names(sims)) %>% lapply(the_pdx_lightgbm_fun, selectA=1)
+pdx_lgb_A0 <- setNames(nm = names(sims)) %>% lapply(the_pdx_lightgbm_fun, selectA=0)
+
+
+par(mfrow=c(2,3))
+lapply(names(sims), function(pop_name){
+plot(pdx_lgb[[pop_name]]$preds$valid[valid[[pop_name]]$A==0], pdx_lgb_A0[[pop_name]]$preds$valid[valid[[pop_name]]$A==0], col=colors_for_gg_A[1], xlab="Market pdx", ylab="Portfolio pdx", ylim=c(0,1), xlim=c(0,1), main=long_labels_for_parms[pop_name])
+points(pdx_lgb[[pop_name]]$preds$valid[valid[[pop_name]]$A==1], pdx_lgb_A1[[pop_name]]$preds$valid[valid[[pop_name]]$A==1], col=colors_for_gg_A[2])
+})
+```
+
+
+## Unaware premium
+
+```{r unmodel, cache=TRUE}
+source('___lgb_unaware.R') 
+
+## clean the preds repo
+unlink(file.path('preds', "*_unaware.json"))
+unaware_lgb <- setNames(nm = names(sims)) %>% lapply(the_unaware_lightgbm_fun)
+
+```
+
+Run unaware for each of the two portfolios: they will differ.
+
+```{r unmodelptf, cache=TRUE}
+unaware_lgb_A1 <- setNames(nm = names(sims)) %>% lapply(the_unaware_lightgbm_fun, selectA=1)
+unaware_lgb_A0 <- setNames(nm = names(sims)) %>% lapply(the_unaware_lightgbm_fun, selectA=0)
+
+par(mfrow=c(2,3))
+lapply(names(sims), function(pop_name){
+plot(unaware_lgb[[pop_name]]$preds$valid[valid[[pop_name]]$A==0], unaware_lgb_A0[[pop_name]]$preds$valid, col=colors_for_gg_A[1], xlab="Market prediction", ylab="Portfolio prediction", ylim=c(80,140), xlim=c(80,140), main=long_labels_for_parms[pop_name])
+points(unaware_lgb[[pop_name]]$preds$valid[valid[[pop_name]]$A==1], unaware_lgb_A1[[pop_name]]$preds$valid, col=colors_for_gg_A[2])
+})
+```
+
+
+## The OT mapping
+
+Python was set up earlier in the document. 
+
+```{r OTmap}
+
+source_python("___opt_transp.py")
+
+## now, the folder 'transported' exist, with one epsilon_y file per scenario
+```
+
+
+## (Temporary cheat) mapping to corrective
+
+I want a mapping, from (SB, D)  to SC. Optimal transport (previous section) is supposed to be okay, but I ain't convinced yet. 
+
+```{r lgbmapping, cache=TRUE}
+source('___lgb_mapping_to_corr.R')
+
+corr_mapping_lgb <- setNames(nm = names(sims)) %>%
+ lapply(the_mapping_to_corr_lightgbm_fun, selectA=0:1)
+
+corr_mapping_lgb_A0 <- setNames(nm = names(sims)) %>%
+ lapply(the_mapping_to_corr_lightgbm_fun, selectA=0)
+
+corr_mapping_lgb_A1 <- setNames(nm = names(sims)) %>%
+ lapply(the_mapping_to_corr_lightgbm_fun, selectA=1)
+
+```
+
+
+# The families of premiums
+
+We need a few ggplot2 tools in `___function.R`.
+
+We will store the five families of premium, first we compute them on the entire market.
+
+```{r premcalc}
+levels_for_scores <- c("SB", "SU", "SA", "SH", "SC")
+labels_for_scores <- c("$S^B(X, D)$","$S^U(X)$", "$S^A(X)$", "$S^H(X)$", "$S^C(\\epsilon_X)$")
+
+scores <- setNames(nm = names(sims)) %>% lapply(function(name){
+  list("SB" = function(x, d){
+    
+    ## simple call of the best estimate model
+    best_lgb[[name]]$pred_fun(data.frame(X = x, D = d))
+  }, "SU" = function(x, d=NULL){
+    
+    ## simple call of the unaware model
+    unaware_lgb[[name]]$pred_fun(data.frame(X = x))
+  }, "SA" = function(x, d = NULL){
+    
+    ## SA = E(SB) unconditional
+    sapply(0:1, function(d){best_lgb[[name]]$pred_fun(data.frame(X = x, D = d))*
+       marg_dist[[name]][d + 1]}) %>% apply(1, sum)
+   }, "SH" = function(x, d = NULL){
+
+    ## Here we cheated by using our mapping of SC
+    ## explicit inference of SC : SH = E(SC|X)
+    tab_corr <- sapply(0:1, function(dl){
+      sb <- best_lgb[[name]]$pred_fun(data.frame(X = x, D = dl))
+      corr_mapping_lgb[[name]](data.frame(SB = sb, D = dl))
+      })
+    tab_pdx <- sapply(0:1, function(dl){
+      pdx_lgb[[name]]$pred_fun(data.frame(X = x, D = dl))
+      })
+
+    (tab_corr * tab_pdx) %>% apply(1, sum)
+  }, "SC" = function(x, d){
+
+    ## SC = T^{d \to \star}(SB(x, d))
+    sb <- best_lgb[[name]]$pred_fun(data.frame(X = x, D = d))
+    corr_mapping_lgb[[name]](data.frame(SB = sb, D = d))
+  }
+    )
+})
+
+```
+
+We also store the versions by portfolio:
+
+```{r premcalcptf}
+levels_for_scores_A <- c("SB", "SU", "SA", "SA.pp", "SH", "SC")
+labels_for_scores_A <- c("$S^B(X, D)$","$S^U(X)$", "$S^A(X)$","$S^A_p(X)$", "$S^H(X)$", "$S^C(\\epsilon_X)$")
+
+scores_A0 <- setNames(nm = names(sims)) %>% lapply(function(name){
+  list("SB" = function(x, d){
+    
+    ## simple call of the best estimate model
+    best_lgb_A0[[name]]$pred_fun(data.frame(X = x, D = d))
+  }, "SU" = function(x, d=NULL){
+    
+    ## simple call of the unaware model
+    unaware_lgb_A0[[name]]$pred_fun(data.frame(X = x))
+  }, "SA" = function(x, d = NULL){
+    
+    ## SA = E(SB) unconditional
+    sapply(0:1, function(d){best_lgb_A0[[name]]$pred_fun(data.frame(X = x, D = d))*
+       marg_dist_A0[[name]][d + 1]}) %>% apply(1, sum)
+  },"SA.pp" = function(x, d = NULL){
+    
+    ## SA = E(SB) unconditional
+    sapply(0:1, function(d){best_lgb_A0[[name]]$pred_fun(data.frame(X = x, D = d))*
+       marg_dist[[name]][d + 1]}) %>% apply(1, sum)
+  }, "SH" = function(x, d = NULL){
+    
+    ## Here we cheated by using our mapping of SC
+    ## explicit inference of SC : SH = E(SC|X)
+    tab_corr <- sapply(0:1, function(dl){
+      sb <- best_lgb_A0[[name]]$pred_fun(data.frame(X = x, D = dl))
+      corr_mapping_lgb_A0[[name]](data.frame(SB = sb, D = dl))
+      })
+    tab_pdx <- sapply(0:1, function(dl){
+      pdx_lgb_A0[[name]]$pred_fun(data.frame(X = x, D = dl))
+      })
+
+    (tab_corr * tab_pdx) %>% apply(1, sum)
+  }, "SC" = function(x, d){
+
+    ## SC = T^{d \to \star}(SB(x, d))
+    sb <- best_lgb_A0[[name]]$pred_fun(data.frame(X = x, D = d))
+    corr_mapping_lgb_A0[[name]](data.frame(SB = sb, D = d))
+  }
+  )
+})
+
+scores_A1 <- setNames(nm = names(sims)) %>% lapply(function(name){
+  list("SB" = function(x, d){
+    
+    ## simple call of the best estimate model
+    best_lgb_A1[[name]]$pred_fun(data.frame(X = x, D = d))
+  }, "SU" = function(x, d=NULL){
+    
+    ## simple call of the unaware model
+    unaware_lgb_A1[[name]]$pred_fun(data.frame(X = x))
+  }, "SA" = function(x, d = NULL){
+    
+    ## SA = E(SB) unconditional
+    sapply(0:1, function(d){best_lgb_A1[[name]]$pred_fun(data.frame(X = x, D = d))*
+       marg_dist_A1[[name]][d + 1]}) %>% apply(1, sum)
+  },"SA.pp" = function(x, d = NULL){
+    
+    ## SA = E(SB) unconditional
+    sapply(0:1, function(d){best_lgb_A1[[name]]$pred_fun(data.frame(X = x, D = d))*
+       marg_dist[[name]][d + 1]}) %>% apply(1, sum)
+  }, "SH" = function(x, d = NULL){
+    
+  # Here we cheated by using our mapping of SC
+  # explicit inference of SC : SH = E(SC|X)
+    tab_corr <- sapply(0:1, function(dl){
+      sb <- best_lgb_A1[[name]]$pred_fun(data.frame(X = x, D = dl))
+      corr_mapping_lgb_A1[[name]](data.frame(SB = sb, D = dl))
+      })
+    tab_pdx <- sapply(0:1, function(dl){
+      pdx_lgb_A1[[name]]$pred_fun(data.frame(X = x, D = dl))
+      })
+
+    (tab_corr * tab_pdx) %>% apply(1, sum)
+  }, "SC" = function(x, d){
+
+    ## SC = T^{d \to \star}(SB(x, d))
+    sb <- best_lgb_A1[[name]]$pred_fun(data.frame(X = x, D = d))
+    corr_mapping_lgb_A1[[name]](data.frame(SB = sb, D = d))
+  }
+  )
+})
+```
+
+
+Now let's try. We compute and store each premium on all scenario over a grid of (x,d) values for the plots.
+
+```{r df_to_g}
+grid_to_test <- expand.grid(x = seq(-10, 11, by = 0.05),
+                            d = c(0, 1))
+
+df_to_g <- setNames(nm = names(sims)) %>% lapply(function(name){
+  data.frame(grid_to_test, 
+           setNames(nm = levels_for_scores) %>% 
+  sapply(function(s){
+    scores[[name]][[s]](x = grid_to_test$x, d = grid_to_test$d)
+  }))
+})
+
+df_to_g_A0 <- setNames(nm = names(sims)) %>% lapply(function(name){
+  data.frame(grid_to_test, 
+           setNames(nm = levels_for_scores_A) %>% 
+  sapply(function(s){
+    scores_A0[[name]][[s]](x = grid_to_test$x, d = grid_to_test$d)
+  }))
+})
+
+df_to_g_A1 <- setNames(nm = names(sims)) %>% lapply(function(name){
+  data.frame(grid_to_test, 
+           setNames(nm = levels_for_scores_A) %>% 
+  sapply(function(s){
+    scores_A1[[name]][[s]](x = grid_to_test$x, d = grid_to_test$d)
+  }))
+})
+```
+
+## Best-estimate versus X
+
+```{r BEvsX, fig.width=12, echo=FALSE}
+
+(to_save_BE_vsX <- names(df_to_g_A1)[1:3] %>% 
+  lapply(function(name){
+    ## The premiums
+    premDat <- rbind(df_to_g[[name]][,c(1,2,3)],df_to_g_A1[[name]][,c(1,2,3)],df_to_g_A0[[name]][,c(1,2,3)]) %>% mutate(Portfolio=rep(c("market","A=1","A=0"), each=dim(df_to_g_A0$original)[1]))
+    
+    ## the colors
+    premDat$Portfolio <- factor(premDat$Portfolio,
+                                levels = names(colors_for_gg_market))
+    
+    ## Make sure to keep the right order
+    cols <- levels(premDat$Portfolio) %>% sapply(function(lvl){
+      colors_for_gg_market[which(lvl == names(colors_for_gg_market))] %>% unname
+    })
+    
+    pop_id <- which(names(df_to_g_A1) == name)
+    
+    # keep only axis for last plot
+    if(which(name == names(df_to_g_A1)) == 1){
+      the_y_label <- latex2exp::TeX("Best-estimate premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(name == names(df_to_g_A1)) == 4){ # If it's on the left, apply correct xlabels
+      the_y_label <- latex2exp::TeX("Best-estimate premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(name == names(df_to_g_A1)) %in% c(5, 6)){ # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { 
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+    
+    ## lets graph
+    premDat %>% 
+      mutate(the_population = name) %>% 
+  filter(x >= -9, x <= 10) %>% 
+  ggplot(aes(x = x, y = SB,
+             col = Portfolio,
+             fill = Portfolio,
+             lty = Portfolio,
+             linewidth = factor(d))) +
+  geom_line(alpha = 0.75) +
+  scale_color_manual(values = cols, name = "A") +
+  scale_fill_manual(values = cols, name = "A") +
+  scale_linetype_manual(values = c(1, 3, 2), name = "A") +
+  scale_linewidth_manual(values = c(1.7, 0.85, 1), name = 'd') + 
+  scale_alpha_manual(values = c(1, 0.3), guide = "none") +
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) +
+       # title = latex2exp::TeX("$D \\nrightarrow X $")) + 
+  scale_x_continuous(breaks = c(-3:3)*4 )  + # see above
+  scale_y_continuous(breaks = seq(70, 150, by=20), limits=c(70,150)) + 
+  theme_classic() + 
+#  the_y_scale +
+  guides(color = guide_legend(override.aes = list(linewidth = 1.5)),  # Adjust linewidth for 'Pop.' legend
+         fill = guide_legend(override.aes = list(linewidth = 1.5)),   # Ensure consistency across color and fill
+         linetype = guide_legend(override.aes = list(linewidth = 1.5))) +  # Adjust linetype legend if needed
+  
+  theme(plot.title = element_text(hjust=0.5))
+  }) %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 12, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_BE_vsX.pdf",
+       plot = to_save_BE_vsX,
+       height = 3,
+       width = 9,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+## Unaware vs X
+
+```{r UnawarevsX, fig.width=12, echo=FALSE}
+(to_save_unaware_vsX <- names(df_to_g_A1)[1:3] %>% lapply(function(pop_name){
+graph_to_return <- rbind(df_to_g[[pop_name]][,c(1,2,4)],df_to_g_A1[[pop_name]][,c(1,2,4)],df_to_g_A0[[pop_name]][,c(1,2,4)]) %>% mutate(Portfolio=rep(c("market","A=1","A=0"), each=dim(df_to_g_A0$original)[1]))
+
+## the colors
+    graph_to_return$Portfolio <- factor(graph_to_return$Portfolio,
+                                levels = names(colors_for_gg_market))
+    
+    ## Make sure to keep the right order
+    cols <- levels(graph_to_return$Portfolio) %>% sapply(function(lvl){
+      colors_for_gg_market[which(lvl == names(colors_for_gg_market))] %>% unname
+    })
+    
+    pop_id <- which(names(df_to_g_A1) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(df_to_g_A1)) == 1){
+      the_y_label <- latex2exp::TeX("Unaware premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(pop_name == names(df_to_g_A1)) == 4){ # If it's on the left, apply correct xlabels
+      the_y_label <- latex2exp::TeX("Unaware premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(pop_name == names(df_to_g_A1)) %in% c(5, 6)){ # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { 
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+    
+    
+graph_to_return %>%
+  filter(x >= -9, x <= 10) %>% 
+  ggplot(aes(x=x, y=SU,
+             col=Portfolio,
+             fill=Portfolio,
+             linetype =Portfolio))+
+  geom_line(alpha = 0.75, linewidth = 1) +
+  scale_color_manual(values = cols, name = "A") +
+  scale_fill_manual(values = cols, name = "A") +
+  scale_linetype_manual(values = c(1, 3, 2), name = "A") +
+labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_name]))+
+    scale_x_continuous(breaks = c(-3:3)*4 )  +
+    scale_y_continuous(breaks = seq(70, 150, by=20), limits=c(70,150)) +
+    theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))
+})%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_unaware_vsX.pdf",
+       plot = to_save_unaware_vsX,
+       height = 3,
+       width = 9,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+
+## Aware vs X
+
+The first graph is the aware by portfolio. The second graph is the "unbiased" version of the aware premium, computed with the marginal distribution of D in the population.
+
+```{r AwarevsX, fig.width=12, echo=FALSE}
+
+(to_save_Aware_vsX <- names(df_to_g_A1)[1:3] %>% lapply(function(pop_name){
+graph_to_return <- rbind(df_to_g[[pop_name]][,c(1,2,5)],df_to_g_A1[[pop_name]][,c(1,2,5)],df_to_g_A0[[pop_name]][,c(1,2,5)]) %>% mutate(Portfolio=rep(c("market","A=1","A=0"), each=dim(df_to_g_A0$original)[1])) 
+
+## the colors
+    graph_to_return$Portfolio <- factor(graph_to_return$Portfolio,
+                                levels = names(colors_for_gg_market))
+    
+    ## Make sure to keep the right order
+    cols <- levels(graph_to_return$Portfolio) %>% sapply(function(lvl){
+      colors_for_gg_market[which(lvl == names(colors_for_gg_market))] %>% unname
+    })
+    
+    pop_id <- which(names(df_to_g_A1) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(df_to_g_A1)) == 1){
+      the_y_label <- latex2exp::TeX("Aware premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(pop_name == names(df_to_g_A1)) == 4){ # If it's on the left, apply correct xlabels
+      the_y_label <- latex2exp::TeX("Aware premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(pop_name == names(df_to_g_A1)) %in% c(5, 6)){ # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { 
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+    
+  graph_to_return %>%
+  filter(x >= -9, x <= 10) %>% 
+  ggplot(aes(x=x, y=SA, 
+             col=Portfolio,
+             fill=Portfolio,
+             linetype =Portfolio))+
+  geom_line(alpha = 0.75, linewidth = 1) +
+  scale_color_manual(values = cols, name = "A") +
+  scale_fill_manual(values = cols, name = "A") +
+  scale_linetype_manual(values = c(1, 3, 2), name = "A") +
+labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_name]))+
+    scale_x_continuous(breaks = c(-3:3)*4 )  +
+    scale_y_continuous(breaks = seq(70, 150, by=20), limits=c(70,150)) +
+    theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))
+  })%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 12, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_Aware_vsX.pdf",
+       plot = to_save_Aware_vsX,
+       height = 3,
+       width = 9,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+(to_save_Awarepop_vsX <- names(df_to_g_A1)[1:3] %>% lapply(function(pop_name){
+graph_to_return <- df_to_g[[pop_name]][,c(1,2,5)]%>% rename(SA.pp = SA) %>%
+  rbind(df_to_g_A1[[pop_name]][,c(1,2,6)],df_to_g_A0[[pop_name]][,c(1,2,6)])%>% 
+  mutate(Portfolio=rep(c("market","A=1","A=0"), each=dim(df_to_g_A0$original)[1])) 
+
+## the colors
+    graph_to_return$Portfolio <- factor(graph_to_return$Portfolio,
+                                levels = names(colors_for_gg_market))
+    
+    ## Make sure to keep the right order
+    cols <- levels(graph_to_return$Portfolio) %>% sapply(function(lvl){
+      colors_for_gg_market[which(lvl == names(colors_for_gg_market))] %>% unname
+    })
+    
+    pop_id <- which(names(df_to_g_A1) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(df_to_g_A1)) == 1){
+      the_y_label <- latex2exp::TeX("Aware premium (market prop)")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(pop_name == names(df_to_g_A1)) == 4){ # If it's on the left, apply correct xlabels
+      the_y_label <- latex2exp::TeX("Aware premium (market prop)")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(pop_name == names(df_to_g_A1)) %in% c(5, 6)){ # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { 
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+
+graph_to_return %>%
+  filter(x >= -9, x <= 10) %>% 
+  ggplot(aes(x=x, y=SA.pp, 
+             col=Portfolio,
+             fill=Portfolio,
+             linetype =Portfolio))+
+  geom_line(alpha = 0.75, linewidth = 1) +
+  scale_color_manual(values = cols, name = "A") +
+  scale_fill_manual(values = cols, name = "A") +
+  scale_linetype_manual(values = c(1, 3, 2), name = "A") +
+labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_name]))+
+    scale_x_continuous(breaks = c(-3:3)*4 )  +
+    scale_y_continuous(breaks = seq(70, 150, by=20), limits=c(70,150)) +
+    theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))
+})%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_AwarePop_vsX.pdf",
+       plot = to_save_Awarepop_vsX,
+       height = 3,
+       width = 9,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+
+## Corrective
+
+```{r CorrectivevsX, echo=FALSE, fig.width=12}
+(to_save_Corrective_vsX <- names(df_to_g_A1)[1:3] %>% lapply(function(pop_name){
+graph_to_return <- rbind(df_to_g[[pop_name]][,c(1,2,7)],df_to_g_A1[[pop_name]][,c(1,2,8)],df_to_g_A0[[pop_name]][,c(1,2,8)]) %>% mutate(Portfolio=rep(c("market","A=1","A=0"), each=dim(df_to_g_A0$original)[1])) 
+    
+## the colors
+    graph_to_return$Portfolio <- factor(graph_to_return$Portfolio,
+                                levels = names(colors_for_gg_market))
+    
+    ## Make sure to keep the right order
+    cols <- levels(graph_to_return$Portfolio) %>% sapply(function(lvl){
+      colors_for_gg_market[which(lvl == names(colors_for_gg_market))] %>% unname
+    })
+    
+    pop_id <- which(names(df_to_g_A1) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(df_to_g_A1)) == 1){
+      the_y_label <- latex2exp::TeX("Corrective premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(pop_name == names(df_to_g_A1)) == 4){ # If it's on the left, apply correct xlabels
+      the_y_label <- latex2exp::TeX("Corrective premium")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(pop_name == names(df_to_g_A1)) %in% c(5, 6)){ # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { 
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    }
+    
+  graph_to_return %>%
+  filter(x >= -9, x <= 10) %>% 
+ ggplot(aes(x = x, y = SC,
+             col = Portfolio,
+             fill = Portfolio,
+             lty = Portfolio,
+             linewidth = factor(d))) +
+  geom_line(alpha = 0.75) +
+  scale_color_manual(values = cols, name = "A") +
+  scale_fill_manual(values = cols, name = "A") +
+  scale_linetype_manual(values = c(1, 3, 2), name = "A") +
+  scale_linewidth_manual(values = c(1.7, 0.85, 1), name = 'd') + 
+  scale_alpha_manual(values = c(1, 0.3), guide = "none") +
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) +
+       # title = latex2exp::TeX("$D \\nrightarrow X $")) + 
+  scale_x_continuous(breaks = c(-3:3)*4 )  + # see above
+  scale_y_continuous(breaks = seq(70, 150, by=20), limits=c(70,150)) + 
+  theme_classic() + 
+#  the_y_scale +
+  guides(color = guide_legend(override.aes = list(linewidth = 1.5)),  # Adjust linewidth for 'Pop.' legend
+         fill = guide_legend(override.aes = list(linewidth = 1.5)),   # Ensure consistency across color and fill
+         linetype = guide_legend(override.aes = list(linewidth = 1.5))) +  # Adjust linetype legend if needed
+  
+  theme(plot.title = element_text(hjust=0.5))
+  })%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 12, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_Corrective_vsX.pdf",
+       plot = to_save_Corrective_vsX,
+       height = 3,
+       width = 9,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+
+## Mean premium paid over market
+
+The theoretical versions of these graphs are easier to grasp, so we might not keep this one?
+
+```{r}
+colors_for_gg_premium2 <- c("Best"=colors_for_gg_premium[1],
+                           "Unaware"=colors_for_gg_premium[2],
+                           "Aware"= colors_for_gg_premium[3])
+
+(to_save_meanprem <- names(df_to_g_A1)[1:3] %>% lapply(function(pop_name){
+
+premB_bycomp <- rep(0, n/10)
+premB_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SB(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premB_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SB(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+
+premA_bycomp <- rep(0, n/10)
+premA_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premA_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+premU_bycomp <- rep(0, n/10)
+premU_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SU(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premU_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SU(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+premC_bycomp <- rep(0, n/10)
+premC_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premC_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+xseq <- seq(-10.5,12, by=0.5)
+Xdiscretized <- cut(test[[pop_name]]$X, xseq)
+midpoint.vec <- xseq[-length(xseq)] + diff(xseq)/2
+names(midpoint.vec) <- levels(Xdiscretized)
+Xmid <- midpoint.vec[Xdiscretized]
+  
+  pop_id <- which(names(df_to_g_A1) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(df_to_g_A1)) %in% c(1,4)){
+      the_y_label <- latex2exp::TeX("Premium")
+      the_y_scale <- scale_y_continuous()
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(labels = NULL)
+      the_x_label <- latex2exp::TeX("x")
+      }
+  
+aggregate(cbind(Best, Unaware, Aware)~Xdisc+D, FUN=mean,
+          data=test[[pop_name]]%>% mutate(Aware = premA_bycomp, 
+                                          Best = premB_bycomp, 
+                                          Unaware = premU_bycomp,
+                                          Corrective = premC_bycomp,
+                                          Xdisc = Xmid))%>%
+  reshape2::melt(measure.vars = c("Best", "Unaware", "Aware"))%>%
+    filter(Xdisc >= -8, Xdisc <= 10) %>%
+ggplot(aes(x=Xdisc, y=value,
+           col=variable,
+           lty=factor(D),
+           alpha=factor(D),
+           linewidth=factor(D)))+
+  geom_line(alpha=0.75)+ 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = seq(-10,10,5))  + # see above
+     # the_y_scale +
+  theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))+
+ # scale_color_manual(values = c(rev(gray.colors(4))[c(2,4)],1), name = "Type") +
+  scale_color_manual(values = unname(colors_for_gg_premium2), name = "Premium") +
+  scale_linetype_manual(values = c(1, 2), name = "d") +
+  scale_alpha_manual(values = c(0.75, 1), name = "d") +
+  scale_linewidth_manual(values = c(1, 0.55), name = 'd') 
+
+  })%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 12, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_mean_prem_paid.pdf",
+       plot = to_save_meanprem,
+       height = 3,
+       width = 9,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+```{r meanpremcor}
+
+(to_save_meanprem_cor <- names(df_to_g_A1)[1:3] %>% lapply(function(pop_name){
+
+premB_bycomp <- rep(0, n/10)
+premB_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SB(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premB_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SB(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+premC_bycomp <- rep(0, n/10)
+premC_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premC_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+xseq <- seq(-10.5,12, by=0.5)
+Xdiscretized <- cut(test[[pop_name]]$X, xseq)
+midpoint.vec <- xseq[-length(xseq)] + diff(xseq)/2
+names(midpoint.vec) <- levels(Xdiscretized)
+Xmid <- midpoint.vec[Xdiscretized]
+  
+  pop_id <- which(names(df_to_g_A1) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(df_to_g_A1)) %in% c(1,4)){
+      the_y_label <- latex2exp::TeX("Premium")
+      the_y_scale <- scale_y_continuous()
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(labels = NULL)
+      the_x_label <- latex2exp::TeX("x")
+      }
+  
+aggregate(cbind(Best, Corrective)~Xdisc+D, FUN=mean,
+          data=test[[pop_name]]%>% mutate(Best = premB_bycomp, 
+                                          Corrective = premC_bycomp,
+                                          Xdisc = Xmid))%>%
+  reshape2::melt(measure.vars = c("Best", "Corrective"))%>%
+    filter(Xdisc >= -8, Xdisc <= 10) %>%
+ggplot(aes(x=Xdisc, y=value,
+           col=variable,
+           lty=factor(D),
+           alpha=factor(D),
+           linewidth=factor(D)))+
+  geom_line(alpha=0.75)+ 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = seq(-10,10,5))  + # see above
+     # the_y_scale +
+  theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))+
+  scale_color_manual(values = colorspace::darken(unname(colors_for_gg_premium[c(1, 4)]), 0.2), name = "Premium") +
+ # scale_color_manual(values = unname(colors_for_gg_premium2), name = "Premium") +
+  scale_linetype_manual(values = c(1, 2), name = "d") +
+  scale_alpha_manual(values = c(0.75, 1), name = "d") +
+  scale_linewidth_manual(values = c(1, 0.55), name = 'd') 
+
+  })%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 12, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_mean_prem_paid_cor.pdf",
+       plot = to_save_meanprem_cor,
+       height = 3,
+       width = 9,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+Version in French for a presentation (not used).
+
+```{r}
+to_save_meanprem_list_forpres <- names(df_to_g_A1)[1:3] %>% lapply(function(pop_name){
+
+premB_bycomp <- rep(0, n/10)
+premB_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SB(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premB_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SB(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+premA_bycomp <- rep(0, n/10)
+premA_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premA_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+premA_market <- scores[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)
+
+xseq <- seq(-10.5,12, by=0.5)
+Xdiscretized <- cut(test[[pop_name]]$X, xseq)
+midpoint.vec <- xseq[-length(xseq)] + diff(xseq)/2
+names(midpoint.vec) <- levels(Xdiscretized)
+Xmid <- midpoint.vec[Xdiscretized]
+  
+  pop_id <- which(names(df_to_g_A1) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(df_to_g_A1)) %in% c(1,4)){
+      the_y_label <- latex2exp::TeX("Valeur de la prime")
+      the_y_scale <- scale_y_continuous()
+      the_x_label <- latex2exp::TeX("x")
+      } else { 
+      the_y_label <- NULL
+      the_y_scale <- scale_y_continuous(labels = NULL)
+      the_x_label <- latex2exp::TeX("x")
+      }
+  
+aggregate(cbind(Best, Aware, Aware_market)~Xdisc+D, FUN=mean,
+          data=test[[pop_name]]%>% mutate(Aware = premA_bycomp, 
+                                          Aware_market = premA_market,
+                                          Best = premB_bycomp, 
+                                          Xdisc = Xmid))%>%
+  reshape2::melt(measure.vars = c("Best", "Aware", "Aware_market"))%>%
+    filter(Xdisc >= -8, Xdisc <= 10) %>%
+ggplot(aes(x=Xdisc, y=value,
+           col=variable,
+           lty=factor(D),
+           linewidth=factor(D)))+
+  geom_line(alpha=0.75)+ 
+  labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_id])) + 
+      scale_x_continuous(breaks = seq(-10,10,5))  + # see above
+     # the_y_scale +
+  theme_minimal()+
+  theme(plot.title = element_text(hjust=0.5))+
+#  scale_color_manual(values = c(rev(gray.colors(4))[c(2,4)],1), name = "Type") +
+  scale_color_manual(values = c(1, 2, gray.colors(3)[2]), name = "Prime", 
+                     labels=c("Précise", "Consciente par ass.", "Consciente complet")) +
+  scale_linetype_manual(values = c(1, 2), name = "D") +
+  scale_linewidth_manual(values = c(1, 0.8), name = 'd') 
+
+  })
+
+(to_save_meanprem_for_pres <- to_save_meanprem_list_forpres %>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 12, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+to_save_meanprem_list_forpres[[1]]
+
+```
+
+# Fairness Criteria
+
+In this section, we assess whether the fairness criteria are verified.
+
+## Big fairness table 
+
+```{r}
+
+the_raw_content_for_big_table <- setNames(nm = names(test)[1:3]) %>% lapply(function(pop_name){
+  setNames(nm = c('1', 'full')) %>%  lapply(function(pop_A_ref){
+    setNames(nm = c('1', '0', 'unbiased', 'mixture')) %>%  lapply(function(pop_A_train){
+          
+      
+          full_local_test <- test[[pop_name]]
+          local_test_A1 <- full_local_test[full_local_test$A == 1, ]
+          
+          if(pop_A_ref == '1'){
+            local_test <- local_test_A1
+          } else {
+            local_test <- full_local_test
+          }
+          
+          ## for balancing
+          mean_Y_loc <- mean(local_test$Y)
+          mean_Y_full <- mean(full_local_test$Y)
+          
+          if(pop_A_train == '1'){
+            scores_to_compute <- scores_A1[[pop_name]] 
+            } else if(pop_A_train == '0'){
+              scores_to_compute <- scores_A0[[pop_name]] 
+            } else {
+            scores_to_compute <- scores[[pop_name]]
+          }
+          
+          the_preds_table_local <- setNames(nm = c('SB', 'SA', 'SC', 'SA_unb')) %>% sapply(function(the_score){
+            if(the_score == 'SA_unb' & pop_A_ref == 'full') return(scores[[pop_name]][['SA']](x = local_test$X, d = local_test$D))
+            if(the_score == 'SA_unb' & pop_A_ref == '1') return(scores_A1[[pop_name]][['SA']](x = local_test$X, d = local_test$D))
+            scores_to_compute[[the_score]](x = local_test$X,
+                                           d = local_test$D)
+          }) %>% as.data.frame()
+          
+          the_preds_table_local_unb <- setNames(nm = c('SB', 'SA', 'SC', 'SA_unb')) %>% sapply(function(the_score){
+            if(the_score == 'SA_unb' & pop_A_ref == 'full') return(scores[[pop_name]][['SA']](x = local_test$X, d = local_test$D))
+            if(the_score == 'SA_unb' & pop_A_ref == '1') return(scores_A1[[pop_name]][['SA']](x = local_test$X, d = local_test$D))
+            scores_to_compute[[the_score]](x = local_test$X,
+                                           d = local_test$D)
+          }) %>% as.data.frame()
+          
+          factor_balance <- mean_Y_loc/apply(the_preds_table_local, 2, mean)
+          factor_balance_unb <- mean_Y_full/apply(the_preds_table_local_unb, 2, mean)
+          
+          the_preds_table_full <- setNames(nm = c('SB', 'SA', 'SC', 'SA_unb')) %>% sapply(function(the_score){
+            if(the_score == 'SA_unb' & pop_A_ref == 'full') return(scores[[pop_name]][['SA']](x = full_local_test$X, d = full_local_test$D))
+            if(the_score == 'SA_unb' & pop_A_ref == '1') return(scores_A1[[pop_name]][['SA']](x = full_local_test$X, d = full_local_test$D))
+            scores_to_compute[[the_score]](x = full_local_test$X,
+                                           d = full_local_test$D)
+          }) %>% as.data.frame()
+          
+          the_preds_table_full_unb <- setNames(nm = c('SB', 'SA', 'SC', 'SA_unb')) %>% sapply(function(the_score){
+            if(the_score == 'SA_unb' & pop_A_ref == 'full') return(scores[[pop_name]][['SA']](x = full_local_test$X, d = full_local_test$D))
+            if(the_score == 'SA_unb' & pop_A_ref == '1') return(scores_A1[[pop_name]][['SA']](x = full_local_test$X, d = full_local_test$D))
+            scores[[pop_name]][[the_score]](x = full_local_test$X,
+                                           d = full_local_test$D)
+          }) %>% as.data.frame()
+          
+          
+          the_preds_table_mixture <- setNames(nm = c('SB', 'SA', 'SC', 'SA_unb')) %>% sapply(function(the_score){
+            if(the_score == 'SA_unb') return(scores[[pop_name]][['SA']](x = full_local_test$X, d = full_local_test$D))
+              
+            prem_A1 <- scores_A1[[pop_name]][[the_score]](x = full_local_test$X,
+                                                  d = full_local_test$D) * factor_balance[the_score]
+            prem_A0 <- scores_A0[[pop_name]][[the_score]](x = full_local_test$X,
+                                                  d = full_local_test$D) * factor_balance[the_score]
+            1:nrow(full_local_test) %>% sapply(function(i){
+              if(full_local_test$A[i] == 1){
+                return(prem_A1[i])
+              } else if(full_local_test$A[i] == 0){
+                return(prem_A0[i])
+              }
+            })
+            }) %>% as.data.frame()
+          
+        return(
+          list('loc_data' = local_test, 
+               'full_data' = full_local_test, 
+               'loc_table' = sweep(the_preds_table_local, 2, factor_balance, '*'),
+               'loc_table_unb' = sweep(the_preds_table_local, 2, factor_balance_unb, '*'),
+               'full_table' =  sweep(the_preds_table_full, 2, factor_balance, '*'),
+               'full_table_unb' = sweep(the_preds_table_full, 2, factor_balance_unb, '*'), 
+               'mixture_table' =  sweep(the_preds_table_mixture, 2, factor_balance_unb, '*'))
+        )  
+    })
+  })
+})
+
+the_tables <- setNames(nm = names(test)[1:3]) %>%  lapply(function(scenario){
+  
+to_fill <- data.frame('i' = rep(1:6, 3),
+                      'scenario' = rep(scenario, (2 + 4)*3),
+                      'qty' = c(rep('LR', 6), rep('Proxy', 6), rep('DP', 6)),
+           'pop_ref' = rep(c(rep('1', 2), rep('full', 4)), 3),
+           'mod_type' = rep(c('1', 'unbiased', '1',
+                              '0', 'unbiased', 'mixture'), 3))
+
+to_fill$SB <- rep(NA, nrow(to_fill))
+to_fill$SA <- rep(NA, nrow(to_fill))
+to_fill$SC <- rep(NA, nrow(to_fill))
+
+wasserstein_by_group <- function(values, group) {
+  # Check inputs
+  if (length(values) != length(group)) stop("Length mismatch between values and group.")
+  if (length(unique(group)) != 2) stop("Group must be binary.")
+  
+  # Convert group to factor with two levels
+  group <- as.factor(group)
+  
+  # Split values by group
+  values0 <- values[group == levels(group)[1]]
+  values1 <- values[group == levels(group)[2]]
+  
+  # Load transport package for wasserstein1d
+  if (!requireNamespace("transport", quietly = TRUE)) {
+    install.packages("transport")
+  }
+  library(transport)
+  
+  # Compute 1D Wasserstein distance
+  return(wasserstein1d(values0, values1))
+}
+
+best_shift_mse_optimize <- function(x, y) {
+  if (length(x) != length(y)) stop("x and y must have the same length")
+  
+  # Define the MSE function to minimize
+  mse_function <- function(c) {
+    mean((x + c - y)^2)
+  }
+  
+  # Optimize over a reasonable range (e.g., -1000 to 1000)
+  result <- optimize(mse_function, interval = c(-1e3, 1e3))
+  
+  # Return both optimal constant and minimum MSE
+  return(result$minimum)
+}
+
+
+for (i in unique(to_fill$i)) {
+  scenario <- to_fill[i, 'scenario']
+  ref_pop <- to_fill[i, 'pop_ref']
+  model <- to_fill[i, 'mod_type']
+  
+  if(ref_pop == '1'){
+    pop_eval_loc <- the_raw_content_for_big_table[[scenario]][[ref_pop]][[model]]$loc_data
+    if(model == 'unbiased'){
+      the_preds_table <- the_raw_content_for_big_table[[scenario]][[ref_pop]][[model]]$loc_table
+    } else {
+      the_preds_table <- the_raw_content_for_big_table[[scenario]][[ref_pop]][[model]]$loc_table_unb
+    }
+  } else {
+    pop_eval_loc <- the_raw_content_for_big_table[[scenario]][[ref_pop]][[model]]$full_data
+    if(model  == 'mixture'){
+      the_preds_table <- the_raw_content_for_big_table[[scenario]][[ref_pop]][[model]]$mixture_table
+    } else if(model  == '1'){
+      the_preds_table <- the_raw_content_for_big_table[[scenario]][[ref_pop]][[model]]$full_table
+    } else {
+      the_preds_table <- the_raw_content_for_big_table[[scenario]][[ref_pop]][[model]]$full_table_unb
+    }
+  }
+  
+  
+  table_to_return <- setNames(nm = c('SB', 'SA', 'SC')) %>% sapply(function(score){
+    ## Loss ratio parity
+    LR <- pop_eval_loc$Y/the_preds_table[[score]]
+    LR_par <- wasserstein_by_group(LR, group = pop_eval_loc$D)
+    
+    ## Demographic parity
+    demo_par <- wasserstein_by_group(the_preds_table[[score]], group = pop_eval_loc$D)
+    
+    ## PD metric... 
+    const_opt <- best_shift_mse_optimize(the_preds_table[[score]], the_preds_table[['SA_unb']])
+    proxy <- wasserstein_by_group(the_preds_table[[score]] + const_opt - the_preds_table[['SA_unb']], 
+                         group = pop_eval_loc$D)
+    
+    names_to_output <- c('LR', 'Proxy', 'DP')
+    setNames(c(LR_par, proxy, demo_par),
+             nm = names_to_output)
+  })
+  
+  to_fill[to_fill$i == i, c('SB', 'SA', 'SC')] <- table_to_return
+}
+
+return(to_fill)
+
+})
+
+
+the_tables %>% do.call(rbind, .) %>% 
+  filter(!(pop_ref == 'full' & mod_type == '0'),
+         !(pop_ref == '1' & mod_type == 'unbiased')) %>% 
+  xtable::xtable(digits = 3)
+```
+
+```{r}
+saveRDS(the_tables %>% do.call(rbind, .), 'preds/metrics_tables')
+```
+
+
+## Aware premium
+
+### Premium Independence criterion
+
+```{r AwareIndep, echo=FALSE, fig.width=12, fig.height=10}
+
+
+# 
+# 
+# (to_save_SA_indep <- names(df_to_g_A1) %>% lapply(function(pop_name){
+# premA_bycomp <- rep(0, n/10)
+# premA_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+# premA_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+# 
+# melted_version <- test[[pop_name]] %>% mutate(premA_bycomp = premA_bycomp,premA = scores[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)) %>%
+#   reshape2::melt(measure.vars = c("premA_bycomp", "premA")) %>% 
+#     mutate(variable = factor(variable,
+#                              levels = c("premA_bycomp", "premA"),
+#                              labels = c("Portfolio-specific", "Market")))%>%
+#   mutate(premAware = value)
+# 
+# ggplot(melted_version, aes(x=premAware, fill=factor(D), col=factor(D)))+
+#   geom_density(alpha=0.5)+
+#   facet_grid(~variable)+
+#   theme_classic()+
+#   scale_color_manual(values=colors_for_gg_D)+
+#   scale_fill_manual(values=colors_for_gg_D)+
+#   ggtitle(long_labels_for_parms[pop_name])+
+#   labs(x="Aware premium", fill="D", col="D")
+# 
+# }))
+
+```
+
+
+### Loss Ratio Independence
+
+It is seen that the aware by company is closer to actuarial fairness than when using the complete market:
+
+```{r, fig.height=10, echo=FALSE}
+(to_save_LR_indep <- names(df_to_g_A1) %>% lapply(function(pop_name){
+  
+premA_bycomp <- rep(0, n/10)
+premA_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premA_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+melted_version <- test[[pop_name]] %>% mutate(premA = scores[[pop_name]]$SA(x = test[[pop_name]]$X,
+                                                                            d=test[[pop_name]]$D))%>%
+  mutate(LRA = Y/premA, LRA_bycomp = Y/premA_bycomp)  %>%
+  reshape2::melt(measure.vars = c("LRA_bycomp", "LRA")) %>% 
+    mutate(variable = factor(variable,
+                             levels = c("LRA_bycomp", "LRA"),
+                             labels = c("Portfolio-specific", "Market")))%>%
+  mutate(LossRatio = value)
+
+ggplot(melted_version, aes(x=LossRatio, fill=factor(D), col=factor(D)))+
+  geom_density(alpha=0.5)+
+  facet_grid(~variable)+
+  theme_classic()+
+  scale_color_manual(values=colors_for_gg_D)+
+  scale_fill_manual(values=colors_for_gg_D)+
+  ggtitle(long_labels_for_parms[pop_name])+
+  labs(x="Loss ratio", fill="D", col="D") + 
+  scale_x_continuous(limits = c(0.7, 1.3),
+                     breaks = c(0.8, 1, 1.2)) 
+
+})%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 3, ncol=2,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+
+ggsave(filename = "figs/graph_LRAware.pdf",
+       plot = to_save_LR_indep,
+       height = 7,
+       width = 11,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+### Separation criterion
+
+Here it is also visible:
+
+```{r, fig.width=12}
+vec_cut <- quantile(valid$original$Y, seq(0,1,0.1)) +c(-0.5, rep(0,9),0.5)
+
+
+(tosave_Aware_givenDY <- names(df_to_g_A1) %>% lapply(function(pop_name){
+groupy <- cut(test[[pop_name]]$Y, vec_cut)
+
+premA_bycomp <- rep(0, n/10)
+premA_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premA_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+melted_version <- test[[pop_name]] %>% mutate(premA_bycomp = premA_bycomp, groupy=groupy, premA = scores[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)) %>%
+  filter(Y>vec_cut[3],Y<=vec_cut[9]) %>% droplevels() %>%
+  reshape2::melt(measure.vars = c("premA_bycomp", "premA")) %>% 
+    mutate(variable = factor(variable,
+                             levels = c("premA_bycomp", "premA"),
+                             labels = c("Portfolio-specific", "Market")))%>%
+  mutate(premAware=value)
+
+
+ggplot(melted_version, aes(x=premAware, fill=factor(D), col=factor(D)))+
+  geom_density(alpha=0.5)+theme_bw()+facet_grid(groupy~variable)+
+  theme_minimal()+
+    scale_color_manual(values=colors_for_gg_D)+
+    scale_fill_manual(values=colors_for_gg_D)+
+  ggtitle(long_labels_for_parms[pop_name])
+})%>%
+ggpubr::ggarrange(plotlist = .,
+                           ncol = 6, nrow=1,
+                           widths = 23, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+```
+
+## Corrective Premium fairness criteria
+
+### Premium independence criterion
+
+```{r, echo=FALSE, fig.width=12, fig.height=10}
+
+(to_save_SC_indep <- names(df_to_g_A1) %>% lapply(function(pop_name){
+premC_bycomp <- rep(0, n/10)
+
+v0 <- valid[[pop_name]][valid[[pop_name]]$A==0, ]
+v1 <- valid[[pop_name]][valid[[pop_name]]$A==1, ]
+v <- valid[[pop_name]]
+
+pb_0 <- sum(v0$Y) / sum(scores_A0[[pop_name]]$SC(x = v0$X, d=v0$D))
+pb_1 <- sum(v1$Y) / sum(scores_A1[[pop_name]]$SC(x = v1$X, d=v1$D))
+mb <- sum(v0$Y) / sum(scores[[pop_name]]$SC(x = v$X, d=v$D))
+
+premC_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)] * pb_0
+premC_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)] * pb_1
+premC <- scores[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D) * mb
+
+
+melted_version <- test[[pop_name]] %>% mutate(premC_bycomp = premC_bycomp,premC = scores[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)) %>%
+  reshape2::melt(measure.vars = c("premC_bycomp", "premC")) %>% 
+    mutate(variable = factor(variable,
+                             levels = c("premC_bycomp", "premC"),
+                             labels = c("Portfolio-specific", "Market")))%>%
+  mutate(premCorrective = value)
+
+ggplot(melted_version, aes(x=premCorrective, fill=factor(D), col=factor(D)))+
+  geom_density(alpha=0.5)+
+  facet_grid(~variable)+
+  theme_classic()+
+  scale_x_continuous(limits = c(80, 140),
+                     breaks = c(90, 110, 130)) + 
+  scale_color_manual(values=colors_for_gg_D)+
+    scale_fill_manual(values=colors_for_gg_D)+
+  ggtitle(long_labels_for_parms[pop_name])+
+  labs(x="Corrective premium", fill="D", col="D")
+
+})%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 3, ncol=2,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_Corrective.pdf",
+       plot = to_save_SC_indep,
+       height = 7,
+       width = 11,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+```{r, echo=FALSE, fig.width=12, fig.height=10}
+
+to_save_SC_indep2 <- function(pop_name){
+premC_bycomp <- rep(0, n/10)
+
+v0 <- valid[[pop_name]][valid[[pop_name]]$A==0, ]
+v1 <- valid[[pop_name]][valid[[pop_name]]$A==1, ]
+v <- valid[[pop_name]]
+
+pb_0 <- sum(v0$Y) / sum(scores_A0[[pop_name]]$SC(x = v0$X, d=v0$D))
+pb_1 <- sum(v1$Y) / sum(scores_A1[[pop_name]]$SC(x = v1$X, d=v1$D))
+mb <- sum(v$Y) / sum(scores[[pop_name]]$SC(x = v$X, d=v$D))
+
+premC_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)] * pb_0
+premC_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)] * pb_1
+premC <- scores[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D) * mb
+
+
+df_to_g_bycomp <- data.frame(muCA = premC_bycomp, 
+                      muC = premC,
+                      'D' = test[[pop_name]]$D,
+                      'A' = c(test[[pop_name]]$A))
+
+df_to_g_market <- df_to_g_bycomp %>% mutate(A = 2)
+
+
+appender <- function(string) latex2exp::TeX(string) 
+
+rbind(df_to_g_bycomp, df_to_g_market) %>% 
+  mutate(A = factor(A, levels = c(0, 2, 1),
+                    labels = c('$A=0$', 'Market', '$A=1$'))) %>% 
+  reshape2::melt(measure.vars = c('muCA', 'muC')) %>%
+  mutate(variable = factor(variable, levels = c('muCA', 'muC'),
+                           labels = c('$S = \\mu^C_{pb}(X, d, A)$',
+                                                            '$S = \\mu^C_{mb}(X, d)$')
+                           )) %>% 
+ggplot(aes(x=value, fill=factor(D), col=factor(D), lty = factor(D), size = factor(D)))+
+  geom_density(alpha=0.4, bw = 1.5)+
+  facet_grid(cols = vars(A), rows = vars(variable),
+             labeller = as_labeller(appender, default = label_parsed))+
+  scale_x_continuous(limits = c(80, 140),
+                     breaks = c(90, 110, 130)) + 
+  theme_classic()+
+  scale_color_manual(values=colors_for_gg_D, name = 'd')+
+    scale_fill_manual(values=colors_for_gg_D, name = 'd')+
+  scale_linetype_manual(values=c('solid', '33'), name = 'd')+
+  scale_size_manual(values=c(1, 0.7), name = 'd')+
+  #ggtitle(long_labels_for_parms[pop_name])+
+  labs(x="s",
+       y = latex2exp::TeX('$\\hat{f}_{S|D, A}(s|d, a)$'),
+       fill="D", col="D") 
+}
+
+to_save_SC_indep2('original')
+
+ggsave(filename = "figs/graph_Corrective2.pdf",
+       plot = to_save_SC_indep2('original'),
+       height = 3.25,
+       width = 8,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+```{r, echo=FALSE, fig.width=12, fig.height=10}
+
+(to_save_SC_indep_full <- names(df_to_g_A1) %>% lapply(function(pop_name){
+premC_bycomp <- rep(0, n/10)
+
+v0 <- valid[[pop_name]][valid[[pop_name]]$A==0,]
+v1 <- valid[[pop_name]][valid[[pop_name]]$A==1,]
+v <- valid[[pop_name]]
+
+pb_0 <- sum(v0$Y) / sum(scores_A0[[pop_name]]$SC(x = v0$X, d=v0$D))
+pb_1 <- sum(v1$Y) / sum(scores_A1[[pop_name]]$SC(x = v1$X, d=v1$D))
+mb <- sum(v$Y) / sum(scores[[pop_name]]$SC(x = v$X, d=v$D))
+
+premC_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)] * pb_0
+premC_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)] * pb_1
+premC <- scores[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D) * mb
+
+df_to_g_bycomp <- data.frame(muCA = premC_bycomp, 
+                      muC = premC,
+                      'D' = test[[pop_name]]$D,
+                      'A' = c(test[[pop_name]]$A))
+
+df_to_g_market <- df_to_g_bycomp %>% mutate(A = 2)
+
+
+appender <- function(string) latex2exp::TeX(string) 
+
+rbind(df_to_g_bycomp, df_to_g_market) %>% 
+  mutate(A = factor(A, levels = c(0, 2, 1),
+                    labels = c('$A=0$', 'Market', '$A=1$'))) %>% 
+  reshape2::melt(measure.vars = c('muCA', 'muC')) %>%
+  mutate(variable = factor(variable, levels = c('muCA', 'muC'),
+                           labels = c('$S = \\mu^C_{pb}(X, d|A)$',
+                                                            '$S = \\mu^C_{mb}(X, d)$')
+                           )) %>% 
+ggplot(aes(x=value, fill=factor(D), col=factor(D)))+
+  geom_density(alpha=0.5, bw = 2)+
+  facet_grid(cols = vars(A), rows = vars(variable),
+             labeller = as_labeller(appender, default = label_parsed),
+             scales = "free_x", space = "free_x")+
+  theme_classic()+
+  scale_color_manual(values=colors_for_gg_D, name = 'd')+
+    scale_fill_manual(values=colors_for_gg_D, name = 'd')+
+  scale_y_continuous(breaks = c(0, 0.02, 0.04)) + 
+  ggtitle(long_labels_for_parms[pop_name])+
+  labs(x="s",
+       y = latex2exp::TeX('$\\hat{f}_{S|D, A}(s|d, a)$'),
+       fill="D", col="D") + 
+  theme(strip.text.y = element_text(size = 6),
+        axis.text.x = element_text(size = 6))
+})%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 3, ncol=2,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+ggsave(filename = "figs/graph_Corrective_full.pdf",
+       plot = to_save_SC_indep_full,
+       height = 7,
+       width = 11,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+### Loss Ratio Independence
+
+Closer to actuarial fairness than when using the complete market:
+
+```{r, fig.height=10, echo=FALSE}
+(to_save_LRC_indep <- names(df_to_g_A1) %>% lapply(function(pop_name){
+  
+premC_bycomp <- rep(0, n/10)
+premC_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+premC_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+melted_version <- test[[pop_name]] %>% mutate(premC = scores[[pop_name]]$SC(x = test[[pop_name]]$X, d=test[[pop_name]]$D))%>%
+  mutate(LRC = Y/premC, LRC_bycomp = Y/premC_bycomp)  %>%
+  reshape2::melt(measure.vars = c("LRC_bycomp", "LRC")) %>% 
+    mutate(variable = factor(variable,
+                             levels = c("LRC_bycomp", "LRC"),
+                             labels = c("Portfolio-specific", "Market")))%>%
+  mutate(LossRatio = value)
+
+ggplot(melted_version, aes(x=LossRatio, fill=factor(D), col=factor(D)))+
+  geom_density(alpha=0.5)+
+  facet_grid(~variable)+
+  theme_classic()+
+  scale_color_manual(values=colors_for_gg_D)+
+    scale_fill_manual(values=colors_for_gg_D)+
+    scale_linetype_manual(values=1:2, name = 'd')+
+  ggtitle(long_labels_for_parms[pop_name])+
+  labs(x="Loss ratio", fill="D", col="D")+
+  scale_x_continuous(limits = c(0.65, 1.35),
+                     breaks = c(0.8, 1, 1.2)) 
+
+})%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 3, ncol=2,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+
+ggsave(filename = "figs/graph_LRCorrective.pdf",
+       plot = to_save_LRC_indep,
+       height = 7,
+       width = 11,
+       units = "in",
+       device = "pdf", dpi = 500)
+
+```
+
+
+
+
+# Results on test set
+
+Here we try to see the aggregate LR and Average premiums by group. We do not keep this representation in the end.
+
+```{r, fig.width=12, fig.height=9}
+
+pop_name <- "original"
+
+testLRandprem <- lapply(names(sims) ,function(pop_name) {
+  test_premA_bycomp <- rep(0, n/10)
+test_premA_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+test_premA_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+test_premApp_bycomp <- rep(0, n/10)
+test_premApp_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA.pp(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+test_premApp_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA.pp(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+test_premU_bycomp <- rep(0, n/10)
+test_premU_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SU(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+test_premU_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SU(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+test_premBE_bycomp <- rep(0, n/10)
+test_premBE_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SB(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+test_premBE_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SB(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+test_wprem <- test[[pop_name]] %>% mutate(premA = test_premA_bycomp, 
+                            premA.pp = test_premApp_bycomp, 
+                            premU = test_premU_bycomp,
+                            premBE = test_premBE_bycomp,
+                            premAmark = scores[[pop_name]]$SA(x = test[[pop_name]]$X,
+                                                               d=test[[pop_name]]$D))
+
+LossRatios <- test_wprem %>% 
+  aggregate(cbind(premBE, premU, premA, premA.pp, premAmark, Y)~D, FUN=sum) %>%
+  mutate(LRBE = Y/premBE, LRU = Y/premU, LRA = Y/premA, 
+         LRpp = Y/premA.pp, LRmarket = Y/premAmark)%>%
+  select(D, LRBE, LRU, LRA, LRpp, LRmarket)%>%
+  rename(BE=LRBE, Unaware=LRU, Aware.bycomp = LRA, Aware.pp = LRpp, Aware.market = LRmarket)%>%
+reshape2::melt(id.vars = 1, measure.vars = 2:6, variable.name = "family", value.name="LR")
+
+# test_wprem %>%
+# aggregate(cbind(premBE, premU, premA, premA.pp, premAmark, Y)~D+A, FUN=sum) %>%
+#   mutate(LRBE = Y/premBE, LRU = Y/premU, LRA = Y/premA, 
+#          LRpp = Y/premA.pp, LRmarket = Y/premAmark)
+
+#test_wprem %>%
+#  aggregate(cbind(premBE, premU, premA, premA.pp, premAmark)~D+A, FUN=mean)
+
+AvgPrem <- test_wprem %>%
+  aggregate(cbind(premBE, premU, premA, premA.pp, premAmark)~D, FUN=mean)%>%
+  rename(BE=premBE, Unaware=premU, Aware.bycomp = premA, Aware.pp = premA.pp, Aware.market = premAmark)%>%
+reshape2::melt(id.vars = 1, measure.vars = 2:6, variable.name = "family", value.name="AvgPrem")
+
+merge(AvgPrem, LossRatios)%>%
+  reshape2::melt(id.vars=1:2, measure.vars=3:4)})
+
+names(testLRandprem) <- names(sims)
+
+
+listofplotLRPREM <- names(testLRandprem) %>% lapply(function(pop_name){ 
+  ggplot(testLRandprem[[pop_name]], aes(x=family, fill=factor(D), y = value))+
+  geom_bar(stat="identity", position=position_dodge())+
+  facet_wrap(~variable, scales="free_y")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle=45, hjust=1))+
+  labs(title = latex2exp::TeX(long_labels_for_parms[pop_name])) })
+
+ggpubr::ggarrange(plotlist=listofplotLRPREM,
+                          ncol = 3, nrow=2,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right')
+```
+
+
+## other graphs
+
+
+```{r}
+names(df_to_g_A1) %>% lapply(function(pop_name){
+pdx_test_byComp <- rep(0, n/10)
+pdx_test_byComp[which(test[[pop_name]]$A==0)] <-
+  pdx_lgb_A0[[pop_name]]$preds$test[which(test[[pop_name]]$A==0)]
+pdx_test_byComp[which(test[[pop_name]]$A==1)] <-
+  pdx_lgb_A1[[pop_name]]$preds$test[which(test[[pop_name]]$A==1)]
+
+test[[pop_name]]%>% mutate(pdx = pdx_test_byComp, D= factor(D)) %>%
+  ggplot(aes(x=X, colour = D, y = pdx))+
+  geom_point(alpha=0.5)+
+  theme_minimal()+
+   labs(x = latex2exp::TeX("$x$"),
+       y = latex2exp::TeX("$P(D=1|X=x,A)$"),
+       title = latex2exp::TeX(long_labels_for_parms[pop_name])) }
+)%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 3, ncol=2,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right')
+
+names(df_to_g_A1) %>% lapply(function(pop_name){
+pdmarg_test_byComp <- rep(0, n/10)
+pdmarg_test_byComp[which(test[[pop_name]]$A==0)] <-
+  marg_dist_A0[[pop_name]][2]
+pdmarg_test_byComp[which(test[[pop_name]]$A==1)] <-
+  marg_dist_A1[[pop_name]][2]
+
+test[[pop_name]]%>% mutate(pdmarg = pdmarg_test_byComp, D= factor(D)) %>%
+  ggplot(aes(y=X, x = factor(pdmarg)))+
+  geom_boxplot()+
+  theme_minimal()+
+   labs(y = latex2exp::TeX("$x$"),
+       x = latex2exp::TeX("$P(D=1|A)$"),
+       title = latex2exp::TeX(long_labels_for_parms[pop_name])) }
+)%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 3, ncol=2,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right')
+```
+
+```{r}
+
+```
+
+
+# Premium rebalancing
+
+I want to compare the SA, the SA.pp and the SA.pp rebalanced.
+
+```{r}
+
+sss <- scores_A0[[pop_name]]$SA.pp(sims[[pop_name]]$X, sims[[pop_name]]$D)[which(sims[[pop_name]]$A==0)]
+
+sss <- sss*sum(sims[[pop_name]]$Y[sims[[pop_name]]$A==0])/sum(sss)
+
+
+SA_rebal_ratios <- names(df_to_g_A1) %>% lapply(function(pop_name){
+  
+premA_bycomp <- rep(0, n)
+premA_bycomp[which(sims[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA(x = sims[[pop_name]]$X, d=sims[[pop_name]]$D)[which(sims[[pop_name]]$A==1)]
+premA_bycomp[which(sims[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA(x = sims[[pop_name]]$X, d=sims[[pop_name]]$D)[which(sims[[pop_name]]$A==0)]
+
+premA <-  scores[[pop_name]]$SA(x = sims[[pop_name]]$X, d=sims[[pop_name]]$D)
+
+premApp_bycomp <- rep(0, n)
+premApp_bycomp[which(sims[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA.pp(x = sims[[pop_name]]$X, d=sims[[pop_name]]$D)[which(sims[[pop_name]]$A==1)]
+premApp_bycomp[which(sims[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA.pp(x = sims[[pop_name]]$X, d=sims[[pop_name]]$D)[which(sims[[pop_name]]$A==0)]
+
+ratios <- c(sum(sims[[pop_name]]$Y)/sum(premA), sum(sims[[pop_name]]$Y[sims[[pop_name]]$A==0])/sum(premA_bycomp[sims[[pop_name]]$A==0]),
+  sum(sims[[pop_name]]$Y[sims[[pop_name]]$A==1])/sum(premA_bycomp[sims[[pop_name]]$A==1]),
+  sum(sims[[pop_name]]$Y[sims[[pop_name]]$A==0])/sum(premApp_bycomp[sims[[pop_name]]$A==0]),
+    sum(sims[[pop_name]]$Y[sims[[pop_name]]$A==1])/sum(premApp_bycomp[sims[[pop_name]]$A==1]))
+
+names(ratios) <- c("market", "A0", "A1", "App0", "App1")
+
+premA_rebal <- premA*ratios[1]
+  
+premA_bycomp_rebal <- rep(0, n)
+premA_bycomp_rebal[which(sims[[pop_name]]$A==1)] <- premA_bycomp[sims[[pop_name]]$A==1]*ratios[3]
+premA_bycomp_rebal[which(sims[[pop_name]]$A==0)] <- premA_bycomp[sims[[pop_name]]$A==0]*ratios[2]
+
+
+premApp_bycomp_rebal <- rep(0, n)
+premApp_bycomp_rebal[which(sims[[pop_name]]$A==1)] <- premApp_bycomp[sims[[pop_name]]$A==1]*ratios[5]
+premApp_bycomp_rebal[which(sims[[pop_name]]$A==0)] <- premApp_bycomp[sims[[pop_name]]$A==0]*ratios[4]
+
+
+## on test data to reduce size of graph here
+test_premA_bycomp <- rep(0, n/10)
+test_premA_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+test_premA_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+test_premApp_bycomp <- rep(0, n/10)
+test_premApp_bycomp[which(test[[pop_name]]$A==1)] <-  scores_A1[[pop_name]]$SA.pp(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==1)]
+test_premApp_bycomp[which(test[[pop_name]]$A==0)] <-  scores_A0[[pop_name]]$SA.pp(x = test[[pop_name]]$X, d=test[[pop_name]]$D)[which(test[[pop_name]]$A==0)]
+
+test_premA_bycomp_rebal <- rep(0, n/10)
+test_premA_bycomp_rebal[which(test[[pop_name]]$A==1)] <- test_premA_bycomp[test[[pop_name]]$A==1]*ratios[3]
+test_premA_bycomp_rebal[which(test[[pop_name]]$A==0)] <- test_premA_bycomp[test[[pop_name]]$A==0]*ratios[2]
+
+
+test_premApp_bycomp_rebal <- rep(0, n/10)
+test_premApp_bycomp_rebal[which(test[[pop_name]]$A==1)] <- test_premApp_bycomp[test[[pop_name]]$A==1]*ratios[5]
+test_premApp_bycomp_rebal[which(test[[pop_name]]$A==0)] <- test_premApp_bycomp[test[[pop_name]]$A==0]*ratios[4]
+
+##
+list(ratios=ratios, premApp_bycomp_rebal=premApp_bycomp_rebal, premA_bycomp_rebal=premA_bycomp_rebal, premA_rebal=premA_rebal,
+     test_premApp_bycomp_rebal=test_premApp_bycomp_rebal,
+     test_premA_bycomp_rebal=test_premA_bycomp_rebal)
+})
+names(SA_rebal_ratios) <- names(sims)
+
+lapply(names(sims), function(i) SA_rebal_ratios[[i]]$ratios)
+
+```
+
+
+With the pp versions, we seem to have problems with scenarios 1 to 3. We see in the following graph that we find again a similar pattern as with the "Portfolio-specific" version of the Aware score, after we rebalance.
+
+```{r}
+(to_save_Awarepoprebal_vsX <- names(df_to_g_A1)[1:3] %>% lapply(function(pop_name){
+  
+  temp <- df_to_g[[pop_name]][,c(1,2,5)]
+  temp$SA <- temp$SA*SA_rebal_ratios[[pop_name]]$ratios["market"]
+  
+  temp_1 <- df_to_g_A1[[pop_name]][,c(1,2,6)]
+  temp_1$SA.pp <- temp_1$SA.pp*SA_rebal_ratios[[pop_name]]$ratios["App1"]
+  temp_0 <- df_to_g_A0[[pop_name]][,c(1,2,6)]
+  temp_0$SA.pp <- temp_0$SA.pp*SA_rebal_ratios[[pop_name]]$ratios["App0"]
+  
+graph_to_return <- temp %>% rename(SA.pp = SA) %>%
+  rbind(temp_1, temp_0)%>% 
+  mutate(Portfolio=rep(c("market","A=1","A=0"), each=dim(df_to_g_A0$original)[1])) 
+
+
+## the colors
+    graph_to_return$Portfolio <- factor(graph_to_return$Portfolio,
+                                levels = names(colors_for_gg_market))
+    
+    ## Make sure to keep the right order
+    cols <- levels(graph_to_return$Portfolio) %>% sapply(function(lvl){
+      colors_for_gg_market[which(lvl == names(colors_for_gg_market))] %>% unname
+    })
+    
+    pop_id <- which(names(df_to_g_A1) == pop_name)
+    
+    # keep only axis for last plot
+    if(which(pop_name == names(df_to_g_A1)) == 1){
+      the_y_label <- latex2exp::TeX("Aware premium (market prop + rebalanced)")
+      the_x_label <- NULL
+    } else if(which(pop_name == names(df_to_g_A1)) == 4){ # If it's on the left, apply correct xlabels
+      the_y_label <- latex2exp::TeX("Aware premium (market prop + rebalanced)")
+      the_x_label <- latex2exp::TeX("$x$")
+    } else if(which(pop_name == names(df_to_g_A1)) %in% c(5, 6)){ # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$x$")
+    } else { 
+      the_y_label <- NULL
+      the_x_label <- NULL
+    }
+
+graph_to_return %>%
+  filter(x >= -9, x <= 10) %>% 
+  ggplot(aes(x=x, y=SA.pp, 
+             col=Portfolio,
+             fill=Portfolio,
+             linetype =Portfolio))+
+  geom_line(alpha = 0.75, linewidth = 1) +
+  scale_color_manual(values = cols, name = "A") +
+  scale_fill_manual(values = cols, name = "A") +
+  scale_linetype_manual(values = c(1, 3, 5), name = "A") +
+labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_name]))+
+    scale_x_continuous(breaks = c(-3:3)*4 )  +
+    scale_y_continuous(breaks = seq(70, 150, by=20), limits=c(70,150)) +
+    theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))
+})%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+```
+
+
+Compare the premiums after rebalancing: Aware versus Aware.pp:
+
+```{r rebal1, fig.width=12, fig.height=8, echo=FALSE}
+(to_save_rebal <- names(df_to_g_A1)[1:3] %>% lapply(function(pop_name){
+  
+  df_to_graph <- data.frame(Aware = SA_rebal_ratios[[pop_name]]$test_premA_bycomp_rebal, 
+                            AwarePP = SA_rebal_ratios[[pop_name]]$test_premApp_bycomp_rebal,
+                            A = test[[pop_name]]$A)
+  
+   if(which(pop_name == names(df_to_g_A1)) == 1){
+      the_y_label <- latex2exp::TeX("$\\tilde{\\mu}^*_{j,pb}(x)$")
+      the_x_label <- NULL
+    } else if(which(pop_name == names(df_to_g_A1)) == 4){ # If it's on the left, apply correct xlabels
+      the_y_label <- latex2exp::TeX("$\\tilde{\\mu}^*_{j,pb}(x)$")
+      the_x_label <- latex2exp::TeX("$\\tilde{\\mu}_{pb}(x|A=j)$")
+    } else if(which(pop_name == names(df_to_g_A1)) %in% c(5, 6)){ # If it's on the left, apply correct xlabels
+      the_y_label <- NULL
+      the_x_label <- latex2exp::TeX("$\\tilde{\\mu}_{pb}(x|A=j)$")
+    } else { 
+      the_y_label <- NULL
+      the_x_label <- NULL
+    }
+  
+  ggplot(df_to_graph, aes(x=Aware, y=AwarePP, col=factor(A), shape=factor(A)))+
+    geom_point(alpha=0.7)+
+labs(x = the_x_label,
+       y = the_y_label,
+       title = latex2exp::TeX(long_labels_for_parms[pop_name]))+
+    theme_classic()+
+  theme(plot.title = element_text(hjust=0.5))+
+   scale_color_manual(values=colors_for_gg_A, name="A")+
+    scale_shape_manual(values=c(16,17),name="A")+
+    geom_abline()
+})%>% ggpubr::ggarrange(plotlist = .,
+                           nrow = 1, ncol=3,
+                           widths = 15, heights = 1,
+                           common.legend = T,
+                           legend = 'right'))
+
+
+ggsave(filename = "figs/graph_rebal.pdf",
+       plot = to_save_rebal,
+       height = 3,
+       width = 9,
+       units = "in",
+       device = "pdf", dpi = 500)
+```
+
+A table instead. 
+
+```{r}
+corr_table <-  names(df_to_g_A1)[1:3] %>% sapply(function(pop_name){
+   
+   c('Pearson' =   cor(SA_rebal_ratios[[pop_name]]$test_premA_bycomp_rebal,
+       SA_rebal_ratios[[pop_name]]$test_premApp_bycomp_rebal, method = 'pearson'),
+     'Kendall' = cor(SA_rebal_ratios[[pop_name]]$test_premA_bycomp_rebal,
+       SA_rebal_ratios[[pop_name]]$test_premApp_bycomp_rebal, method = 'kendall'),
+     'Spearman' = cor(SA_rebal_ratios[[pop_name]]$test_premA_bycomp_rebal,
+       SA_rebal_ratios[[pop_name]]$test_premApp_bycomp_rebal, method = 'spearman'))
+
+})
+
+xtable::xtable(corr_table, digits = 4)
+```
+
+
+
+
